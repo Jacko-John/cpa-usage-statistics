@@ -1,14 +1,50 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+func TestOKManagementEnvelopeMatchesGenericJSON(t *testing.T) {
+	responses := []managementResponse{
+		jsonManagementResponse(200, map[string]any{
+			"items": []string{strings.Repeat("large payload ", 100_000)},
+		}),
+		{
+			StatusCode: 204,
+			Headers:    map[string][]string{"X-Test": {"one", "two"}},
+			Body:       nil,
+		},
+	}
+
+	for _, response := range responses {
+		got, err := okEnvelope(response)
+		if err != nil {
+			t.Fatalf("okEnvelope: %v", err)
+		}
+		inner, err := json.Marshal(response)
+		if err != nil {
+			t.Fatalf("marshal management response: %v", err)
+		}
+		want, err := json.Marshal(envelope{OK: true, Result: inner})
+		if err != nil {
+			t.Fatalf("marshal envelope: %v", err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("optimized envelope differs from generic JSON encoding")
+		}
+	}
+}
 
 func newTestStore(t *testing.T) *SQLiteStore {
 	t.Helper()
@@ -28,8 +64,8 @@ func TestInsertQueryDelete(t *testing.T) {
 		ID: "record-1", Timestamp: ts, APIKey: "api-key-1", Provider: "anthropic",
 		Model: "claude-sonnet-4-5", Source: "claude-code", AuthIndex: "auth-1",
 		ReasoningEffort: "high", ServiceTier: "priority", LatencyMs: 1250, TTFTMs: 200,
-		Tokens:      TokenStats{InputTokens: 10, OutputTokens: 20, ReasoningTokens: 3, CachedTokens: 4, CacheReadTokens: 1, CacheCreationTokens: 2, TotalTokens: 33},
-		Failed:      true, FailureStatusCode: 429, FailureBody: "rate limited",
+		Tokens: TokenStats{InputTokens: 10, OutputTokens: 20, ReasoningTokens: 3, CachedTokens: 4, CacheReadTokens: 1, CacheCreationTokens: 2, TotalTokens: 33},
+		Failed: true, FailureStatusCode: 429, FailureBody: "rate limited",
 	}
 	if err := store.Insert(ctx, rec); err != nil {
 		t.Fatalf("Insert: %v", err)
@@ -54,12 +90,55 @@ func TestInsertQueryDelete(t *testing.T) {
 		t.Fatalf("failure = %+v", d)
 	}
 
-	res, err := store.Delete(ctx, []string{"record-1", "missing"})
+	ids := newOrderedStringSet(2)
+	ids.Add("record-1")
+	ids.Add("missing")
+	res, err := store.Delete(ctx, ids)
 	if err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if res.Deleted != 1 || len(res.Missing) != 1 || res.Missing[0] != "missing" {
 		t.Fatalf("delete result = %+v", res)
+	}
+}
+
+func TestOrderedStringSetIsUniqueAndStable(t *testing.T) {
+	set := newOrderedStringSet(4)
+	for _, value := range []string{"first", "second", "first", "third"} {
+		set.Add(value)
+	}
+	if want := []string{"first", "second", "third"}; !slices.Equal(set.Values(), want) {
+		t.Fatalf("values = %v, want %v", set.Values(), want)
+	}
+}
+
+func TestDeleteBatchesAndReportsMissingInOrder(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	idValues := make([]string, 501)
+	ids := newOrderedStringSet(len(idValues))
+	for i := range idValues {
+		idValues[i] = fmt.Sprintf("record-%03d", i)
+		ids.Add(idValues[i])
+	}
+	for _, id := range []string{idValues[0], idValues[500]} {
+		if err := store.Insert(ctx, Record{ID: id, Timestamp: time.Now()}); err != nil {
+			t.Fatalf("Insert %s: %v", id, err)
+		}
+	}
+
+	res, err := store.Delete(ctx, ids)
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if res.Deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", res.Deleted)
+	}
+	if len(res.Missing) != 499 {
+		t.Fatalf("missing len = %d, want 499", len(res.Missing))
+	}
+	if res.Missing[0] != idValues[1] || res.Missing[498] != idValues[499] {
+		t.Fatalf("missing order is incorrect: first=%q last=%q", res.Missing[0], res.Missing[len(res.Missing)-1])
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,11 +48,59 @@ type envelopeError struct {
 func main() {}
 
 func okEnvelope(v any) ([]byte, error) {
+	if response, ok := v.(managementResponse); ok {
+		return okManagementEnvelope(response)
+	}
 	result, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
 	}
 	return json.Marshal(envelope{OK: true, Result: result})
+}
+
+// okManagementEnvelope encodes a management response directly into its ABI
+// envelope. This preserves the []byte Body wire format while removing the
+// intermediate managementResponse JSON allocation and RawMessage copy.
+func okManagementEnvelope(response managementResponse) ([]byte, error) {
+	// Headers 通常很小，继续交给 encoding/json 可以完整保留 map 的标准编码规则。
+	headers, err := json.Marshal(response.Headers)
+	if err != nil {
+		return nil, err
+	}
+
+	// 这些片段对应 envelope 和 managementResponse 的固定 JSON 字段。
+	const prefix = `{"ok":true,"result":{"StatusCode":`
+	const headersPrefix = `,"Headers":`
+	const bodyPrefix = `,"Body":`
+	const suffix = `}}`
+
+	// []byte 在 JSON 中使用 Base64 字符串表示；nil 切片则表示为 null。
+	bodyLen := 4 // null
+	if response.Body != nil {
+		bodyLen = base64.StdEncoding.EncodedLen(len(response.Body)) + 2
+	}
+
+	// 预先计算最终大小，让结果缓冲区一次分配即可容纳完整响应。
+	capacity := len(prefix) + 20 + len(headersPrefix) + len(headers) + len(bodyPrefix) + bodyLen + len(suffix)
+	result := make([]byte, 0, capacity)
+
+	// 按结构体字段顺序直接写入最终 envelope，保持原有 JSON 输出格式。
+	result = append(result, prefix...)
+	result = strconv.AppendInt(result, int64(response.StatusCode), 10)
+	result = append(result, headersPrefix...)
+	result = append(result, headers...)
+	result = append(result, bodyPrefix...)
+
+	// Body 直接追加到最终缓冲区，从而省去完整中间 JSON 缓冲区。
+	if response.Body == nil {
+		result = append(result, "null"...)
+	} else {
+		result = append(result, '"')
+		result = base64.StdEncoding.AppendEncode(result, response.Body)
+		result = append(result, '"')
+	}
+	result = append(result, suffix...)
+	return result, nil
 }
 
 func errorEnvelope(code, message string) []byte {
@@ -310,20 +359,13 @@ func usageDelete(req managementRequest) ([]byte, error) {
 			return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "invalid body"}))
 		}
 	}
-	ids := make([]string, 0, len(body.IDs))
-	seen := make(map[string]struct{}, len(body.IDs))
+	ids := newOrderedStringSet(len(body.IDs))
 	for _, id := range body.IDs {
-		trimmed := strings.TrimSpace(id)
-		if trimmed == "" {
-			continue
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			ids.Add(trimmed)
 		}
-		if _, exists := seen[trimmed]; exists {
-			continue
-		}
-		seen[trimmed] = struct{}{}
-		ids = append(ids, trimmed)
 	}
-	if len(ids) == 0 {
+	if ids.Len() == 0 {
 		return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "ids required"}))
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)

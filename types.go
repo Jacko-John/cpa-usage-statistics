@@ -75,3 +75,41 @@ type DeleteResult struct {
 	Deleted int64    `json:"deleted"`
 	Missing []string `json:"missing"`
 }
+
+// OrderedStringSet keeps each string once while preserving insertion order.
+type OrderedStringSet struct {
+	values []string
+	seen   map[string]struct{}
+}
+
+func newOrderedStringSet(capacity int) *OrderedStringSet {
+	return &OrderedStringSet{
+		values: make([]string, 0, capacity),
+		seen:   make(map[string]struct{}, capacity),
+	}
+}
+
+// Add inserts value when it is new and reports whether the set changed.
+func (s *OrderedStringSet) Add(value string) bool {
+	if _, exists := s.seen[value]; exists {
+		return false
+	}
+	s.seen[value] = struct{}{}
+	s.values = append(s.values, value)
+	return true
+}
+
+func (s *OrderedStringSet) Len() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.values)
+}
+
+// Values returns values in insertion order. Callers use the slice as read-only.
+func (s *OrderedStringSet) Values() []string {
+	if s == nil {
+		return nil
+	}
+	return s.values
+}

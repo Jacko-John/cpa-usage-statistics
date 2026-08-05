@@ -193,19 +193,19 @@ INSERT INTO usage_records (
 	failed, failure_status_code, failure_body
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `,
-		strings.TrimSpace(record.ID),
+		record.ID,
 		formatRecordTimestamp(record.Timestamp),
-		strings.TrimSpace(record.APIKey),
-		strings.TrimSpace(record.Provider),
+		record.APIKey,
+		record.Provider,
 		normalizeModel(record.Model),
-		strings.TrimSpace(record.Alias),
-		strings.TrimSpace(record.Source),
-		strings.TrimSpace(record.AuthID),
-		strings.TrimSpace(record.AuthIndex),
-		strings.TrimSpace(record.AuthType),
-		strings.TrimSpace(record.ExecutorType),
-		strings.TrimSpace(record.ReasoningEffort),
-		strings.TrimSpace(record.ServiceTier),
+		record.Alias,
+		record.Source,
+		record.AuthID,
+		record.AuthIndex,
+		record.AuthType,
+		record.ExecutorType,
+		record.ReasoningEffort,
+		record.ServiceTier,
 		nonNegative(record.LatencyMs),
 		nonNegative(record.TTFTMs),
 		tokens.InputTokens,
@@ -217,7 +217,7 @@ INSERT INTO usage_records (
 		tokens.TotalTokens,
 		boolToInt(record.Failed),
 		nonNegativeInt(record.FailureStatusCode),
-		strings.TrimSpace(record.FailureBody),
+		record.FailureBody,
 	)
 	if err != nil {
 		return fmt.Errorf("usage sqlite insert: %w", err)
@@ -303,10 +303,12 @@ FROM usage_records`
 
 		key := groupingKey(apiKey, detail.Provider)
 		modelKey := normalizeModel(detail.Model)
-		if result[key] == nil {
-			result[key] = map[string][]RequestDetail{}
+		models := result[key]
+		if models == nil {
+			models = make(map[string][]RequestDetail, 32)
+			result[key] = models
 		}
-		result[key][modelKey] = append(result[key][modelKey], detail)
+		models[modelKey] = append(result[key][modelKey], detail)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("usage sqlite rows: %w", err)
@@ -314,31 +316,73 @@ FROM usage_records`
 	return result, nil
 }
 
-// Delete removes records by id and reports which ids were absent.
-func (s *SQLiteStore) Delete(ctx context.Context, ids []string) (DeleteResult, error) {
+// Delete removes records by id and reports which ids were absent. The ordered
+// set provides unique IDs and preserves their original order.
+func (s *SQLiteStore) Delete(ctx context.Context, ids *OrderedStringSet) (DeleteResult, error) {
 	result := DeleteResult{Missing: []string{}}
+	values := ids.Values()
 	if s == nil || s.db == nil {
-		result.Missing = append(result.Missing, ids...)
+		result.Missing = append(result.Missing, values...)
 		return result, nil
 	}
-	for _, id := range ids {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			continue
+	if len(values) == 0 {
+		return result, nil
+	}
+
+	// Use one transaction so all batches require only one database commit.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return result, fmt.Errorf("usage sqlite begin delete: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Keep each statement comfortably within SQLite's parameter limit. RETURNING
+	// identifies every deleted row, allowing Missing to be computed precisely.
+	const deleteBatchSize = 500
+	deletedIDs := make(map[string]struct{}, len(values))
+	for start := 0; start < len(values); start += deleteBatchSize {
+		end := min(start+deleteBatchSize, len(values))
+		batch := values[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		query := "DELETE FROM usage_records WHERE id IN (" + placeholders + ") RETURNING id"
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			args[i] = id
 		}
-		res, err := s.db.ExecContext(ctx, "DELETE FROM usage_records WHERE id = ?", id)
+
+		rows, err := tx.QueryContext(ctx, query, args...)
 		if err != nil {
-			return result, fmt.Errorf("usage sqlite delete %s: %w", id, err)
+			return result, fmt.Errorf("usage sqlite delete batch: %w", err)
 		}
-		rows, err := res.RowsAffected()
-		if err != nil {
-			return result, fmt.Errorf("usage sqlite rows affected: %w", err)
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return result, fmt.Errorf("usage sqlite scan deleted id: %w", err)
+			}
+			deletedIDs[id] = struct{}{}
 		}
-		if rows == 0 {
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return result, fmt.Errorf("usage sqlite deleted rows: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return result, fmt.Errorf("usage sqlite close deleted rows: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return result, fmt.Errorf("usage sqlite commit delete: %w", err)
+	}
+
+	result.Deleted = int64(len(deletedIDs))
+	if len(deletedIDs) == len(values) {
+		return result, nil
+	}
+
+	for _, id := range values {
+		if _, deleted := deletedIDs[id]; !deleted {
 			result.Missing = append(result.Missing, id)
-			continue
 		}
-		result.Deleted += rows
 	}
 	return result, nil
 }
