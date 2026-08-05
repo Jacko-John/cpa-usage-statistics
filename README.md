@@ -39,9 +39,11 @@ plugins:
       data_dir: ""
       # 可选：保留天数，超过则清理旧记录；0 表示不清理
       retention_days: 0
+      # 可选：内存中缓存的最新记录数量；范围 0～1000000，0 表示关闭缓存，缺省为 10000
+      cache_size: 10000
 ```
 
-`data_dir` 也可用环境变量 `USAGE_STATISTICS_DIR` 指定。中文配置键 `用量保留天数`、`数据目录` 同样可用。
+`data_dir` 也可用环境变量 `USAGE_STATISTICS_DIR` 指定。中文配置键 `用量保留天数`、`缓存大小`、`数据目录` 同样可用。
 
 ## API
 

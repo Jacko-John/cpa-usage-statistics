@@ -90,7 +90,7 @@ func TestInsertQueryDelete(t *testing.T) {
 		t.Fatalf("failure = %+v", d)
 	}
 
-	ids := newOrderedStringSet(2)
+	ids := NewStableStringSet(2)
 	ids.Add("record-1")
 	ids.Add("missing")
 	res, err := store.Delete(ctx, ids)
@@ -103,7 +103,7 @@ func TestInsertQueryDelete(t *testing.T) {
 }
 
 func TestOrderedStringSetIsUniqueAndStable(t *testing.T) {
-	set := newOrderedStringSet(4)
+	set := NewStableStringSet(4)
 	for _, value := range []string{"first", "second", "first", "third"} {
 		set.Add(value)
 	}
@@ -116,7 +116,7 @@ func TestDeleteBatchesAndReportsMissingInOrder(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	idValues := make([]string, 501)
-	ids := newOrderedStringSet(len(idValues))
+	ids := NewStableStringSet(len(idValues))
 	for i := range idValues {
 		idValues[i] = fmt.Sprintf("record-%03d", i)
 		ids.Add(idValues[i])
@@ -152,9 +152,9 @@ func TestQueryFiltersByRange(t *testing.T) {
 		{ID: "in", Timestamp: start.Add(30 * time.Minute), APIKey: "k", Model: "m"},
 		{ID: "after", Timestamp: end.Add(time.Minute), APIKey: "k", Model: "m"},
 	}
-	for _, r := range records {
-		if err := store.Insert(ctx, r); err != nil {
-			t.Fatalf("Insert %s: %v", r.ID, err)
+	for i := range records {
+		if err := store.Insert(ctx, records[i]); err != nil {
+			t.Fatalf("Insert %s: %v", records[i].ID, err)
 		}
 	}
 	usage, err := store.Query(ctx, QueryRange{Start: &start, End: &end})
@@ -164,6 +164,130 @@ func TestQueryFiltersByRange(t *testing.T) {
 	details := usage["k"]["m"]
 	if len(details) != 1 || details[0].ID != "in" {
 		t.Fatalf("range filter = %+v", usage)
+	}
+}
+
+func TestCacheSupplementsDatabaseAcrossTimestampBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	ctx := context.Background()
+	base := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
+	records := []Record{
+		{ID: "old", Timestamp: base, APIKey: "k", Model: "m"},
+		{ID: "same-a", Timestamp: base.Add(time.Minute), APIKey: "k", Model: "m"},
+		{ID: "same-b", Timestamp: base.Add(time.Minute), APIKey: "k", Model: "m"},
+		{ID: "new", Timestamp: base.Add(2 * time.Minute), APIKey: "k", Model: "m"},
+	}
+	for i := range records {
+		if err := store.Insert(ctx, records[i]); err != nil {
+			t.Fatalf("Insert %s: %v", records[i].ID, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	store, err = NewSQLiteStoreWithCache(path, 2)
+	if err != nil {
+		t.Fatalf("NewSQLiteStoreWithCache: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if store.cache.boundary == nil || store.cache.count != 2 {
+		t.Fatalf("cache state: boundary=%v count=%d", store.cache.boundary, store.cache.count)
+	}
+
+	usage, err := store.Query(ctx, QueryRange{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	details := usage["k"]["m"]
+	got := make([]string, len(details))
+	for i, detail := range details {
+		got[i] = detail.ID
+	}
+	if want := []string{"old", "same-a", "same-b", "new"}; !slices.Equal(got, want) {
+		t.Fatalf("ids = %v, want %v", got, want)
+	}
+
+	// A range strictly after the database boundary is served entirely by cache.
+	start := base.Add(time.Minute + time.Nanosecond)
+	if err := store.db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+	usage, err = store.Query(ctx, QueryRange{Start: &start})
+	if err != nil {
+		t.Fatalf("cached range Query: %v", err)
+	}
+	if details := usage["k"]["m"]; len(details) != 1 || details[0].ID != "new" {
+		t.Fatalf("cached range usage = %+v", usage)
+	}
+}
+
+func TestCacheSynchronizesInsertDeleteAndDeleteBefore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	store, err := NewSQLiteStoreWithCache(path, 2)
+	if err != nil {
+		t.Fatalf("NewSQLiteStoreWithCache: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	base := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
+	for i, id := range []string{"one", "two", "three"} {
+		if err := store.Insert(ctx, Record{ID: id, Timestamp: base.Add(time.Duration(i) * time.Minute), APIKey: "k", Model: "m"}); err != nil {
+			t.Fatalf("Insert %s: %v", id, err)
+		}
+	}
+	if store.cache.boundary == nil || store.cache.count != 2 {
+		t.Fatalf("cache after insert: boundary=%v count=%d", store.cache.boundary, store.cache.count)
+	}
+
+	ids := NewStableStringSet(1)
+	ids.Add("three")
+	if _, err := store.Delete(ctx, ids); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if store.cache.count != 1 || store.cache.record(0).detail.ID != "two" {
+		t.Fatalf("cache after delete: count=%d", store.cache.count)
+	}
+
+	cutoff := base.Add(30 * time.Second)
+	if _, err := store.DeleteBefore(ctx, cutoff); err != nil {
+		t.Fatalf("DeleteBefore: %v", err)
+	}
+	if store.cache.boundary != nil || store.cache.count != 1 {
+		t.Fatalf("cache after cleanup: boundary=%v count=%d", store.cache.boundary, store.cache.count)
+	}
+	usage, err := store.Query(ctx, QueryRange{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if details := usage["k"]["m"]; len(details) != 1 || details[0].ID != "two" {
+		t.Fatalf("usage after cache sync = %+v", usage)
+	}
+}
+
+func TestCompleteCacheServesQueryAfterDatabaseClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	store, err := NewSQLiteStoreWithCache(path, 2)
+	if err != nil {
+		t.Fatalf("NewSQLiteStoreWithCache: %v", err)
+	}
+	ctx := context.Background()
+	if err := store.Insert(ctx, Record{ID: "cached", Timestamp: time.Now(), APIKey: "k", Model: "m"}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+	usage, err := store.Query(ctx, QueryRange{})
+	if err != nil {
+		t.Fatalf("cached Query: %v", err)
+	}
+	if details := usage["k"]["m"]; len(details) != 1 || details[0].ID != "cached" {
+		t.Fatalf("cached usage = %+v", usage)
 	}
 }
 
@@ -220,17 +344,32 @@ func TestToRecordMapping(t *testing.T) {
 }
 
 func TestParseConfig(t *testing.T) {
-	cfg := parseConfig([]byte("enabled: true\npriority: 120\ndata_dir: /tmp/usage\nretention_days: 45\n"))
+	cfg := parseConfig([]byte("enabled: true\npriority: 120\ndata_dir: /tmp/usage\nretention_days: 45\ncache_size: 256\n"))
 	if cfg.DataDir != "/tmp/usage" {
 		t.Fatalf("data_dir = %q", cfg.DataDir)
 	}
 	if cfg.RetentionDays != 45 {
 		t.Fatalf("retention_days = %d", cfg.RetentionDays)
 	}
+	if cfg.CacheSize != 256 {
+		t.Fatalf("cache_size = %d", cfg.CacheSize)
+	}
 
-	zh := parseConfig([]byte("用量保留天数: 7\n"))
+	zh := parseConfig([]byte("用量保留天数: 7\n缓存大小: 128\n"))
 	if zh.RetentionDays != 7 {
 		t.Fatalf("chinese retention = %d", zh.RetentionDays)
+	}
+	if zh.CacheSize != 128 {
+		t.Fatalf("chinese cache size = %d", zh.CacheSize)
+	}
+
+	maximum := parseConfig([]byte("cache_size: 1000001\n"))
+	if maximum.CacheSize != maxCacheSize {
+		t.Fatalf("maximum cache size = %d, want %d", maximum.CacheSize, maxCacheSize)
+	}
+	minimum := parseConfig([]byte("cache_size: -1\n"))
+	if minimum.CacheSize != 0 {
+		t.Fatalf("minimum cache size = %d, want 0", minimum.CacheSize)
 	}
 }
 

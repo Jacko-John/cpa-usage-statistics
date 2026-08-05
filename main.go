@@ -167,6 +167,7 @@ func registerResponse() registerResponsePayload {
 			ConfigFields: []configFieldInfo{
 				{Name: "data_dir", Type: "string", Description: "Directory for usage.db. Defaults to ~/.cli-proxy-api/plugins/usage-statistics."},
 				{Name: "retention_days", Type: "integer", Description: "Delete usage records older than this many days. 0 disables cleanup."},
+				{Name: "cache_size", Type: "integer", Description: "Number of recent usage records kept in memory, from 0 to 1,000,000. 0 disables caching. Defaults to 10,000."},
 			},
 		},
 		Capabilities: capabilitiesInfo{UsagePlugin: true, ManagementAPI: true},
@@ -359,7 +360,7 @@ func usageDelete(req managementRequest) ([]byte, error) {
 			return okEnvelope(jsonManagementResponse(400, map[string]string{"error": "invalid body"}))
 		}
 	}
-	ids := newOrderedStringSet(len(body.IDs))
+	ids := NewStableStringSet(len(body.IDs))
 	for _, id := range body.IDs {
 		if trimmed := strings.TrimSpace(id); trimmed != "" {
 			ids.Add(trimmed)
@@ -423,9 +424,10 @@ func jsonManagementResponse(status int, payload any) managementResponse {
 // ---- store lifecycle -------------------------------------------------------
 
 var (
-	storeMu       sync.RWMutex
-	globalStore   *SQLiteStore
-	currentDBPath string
+	storeMu          sync.RWMutex
+	globalStore      *SQLiteStore
+	currentDBPath    string
+	currentCacheSize int
 
 	retentionDays atomic.Int64
 
@@ -446,6 +448,7 @@ func closeStore() {
 		_ = globalStore.Close()
 		globalStore = nil
 		currentDBPath = ""
+		currentCacheSize = 0
 	}
 }
 
@@ -456,10 +459,10 @@ func ensureStore(cfg pluginConfig) error {
 	}
 	storeMu.Lock()
 	defer storeMu.Unlock()
-	if globalStore != nil && currentDBPath == path {
+	if globalStore != nil && currentDBPath == path && currentCacheSize == cfg.CacheSize {
 		return nil
 	}
-	store, err := NewSQLiteStore(path)
+	store, err := NewSQLiteStoreWithCache(path, cfg.CacheSize)
 	if err != nil {
 		return err
 	}
@@ -468,6 +471,7 @@ func ensureStore(cfg pluginConfig) error {
 	}
 	globalStore = store
 	currentDBPath = path
+	currentCacheSize = cfg.CacheSize
 	return nil
 }
 

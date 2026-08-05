@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -16,14 +18,23 @@ const sqliteTimestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
 // SQLiteStore persists usage records in a pure-Go SQLite database.
 type SQLiteStore struct {
-	db *sql.DB
+	db    *sql.DB
+	mu    sync.RWMutex
+	cache *usageRecordCache
 }
 
 // NewSQLiteStore opens (creating if needed) the usage database at path.
 func NewSQLiteStore(path string) (*SQLiteStore, error) {
+	return NewSQLiteStoreWithCache(path, 0)
+}
+
+// NewSQLiteStoreWithCache opens the database and caches the latest cacheSize
+// records. A cacheSize of zero keeps all queries on SQLite.
+func NewSQLiteStoreWithCache(path string, cacheSize int) (*SQLiteStore, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("usage sqlite path is empty")
 	}
+	cacheSize = normalizeCacheSize(cacheSize)
 	if err := prepareSQLitePath(path); err != nil {
 		return nil, err
 	}
@@ -36,6 +47,13 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	if err := store.initSchema(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if cacheSize > 0 {
+		store.cache = newUsageRecordCache(cacheSize)
+		if err := store.warmCache(context.Background()); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	return store, nil
 }
@@ -181,9 +199,10 @@ func (s *SQLiteStore) Insert(ctx context.Context, record Record) error {
 	if strings.TrimSpace(record.ID) == "" {
 		return fmt.Errorf("usage record id is empty")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	tokens := nonNegativeTokenStats(record.Tokens)
-	tokens.TotalTokens = normalizeTotalTokens(tokens)
+	record = normalizeStoredRecord(record)
 
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO usage_records (
@@ -206,21 +225,24 @@ INSERT INTO usage_records (
 		record.ExecutorType,
 		record.ReasoningEffort,
 		record.ServiceTier,
-		nonNegative(record.LatencyMs),
-		nonNegative(record.TTFTMs),
-		tokens.InputTokens,
-		tokens.OutputTokens,
-		tokens.ReasoningTokens,
-		tokens.CachedTokens,
-		tokens.CacheReadTokens,
-		tokens.CacheCreationTokens,
-		tokens.TotalTokens,
+		record.LatencyMs,
+		record.TTFTMs,
+		record.Tokens.InputTokens,
+		record.Tokens.OutputTokens,
+		record.Tokens.ReasoningTokens,
+		record.Tokens.CachedTokens,
+		record.Tokens.CacheReadTokens,
+		record.Tokens.CacheCreationTokens,
+		record.Tokens.TotalTokens,
 		boolToInt(record.Failed),
-		nonNegativeInt(record.FailureStatusCode),
+		record.FailureStatusCode,
 		record.FailureBody,
 	)
 	if err != nil {
 		return fmt.Errorf("usage sqlite insert: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.add(cachedUsageRecordFromRecord(record))
 	}
 	return nil
 }
@@ -230,6 +252,36 @@ func (s *SQLiteStore) Query(ctx context.Context, rng QueryRange) (APIUsage, erro
 	if s == nil || s.db == nil {
 		return APIUsage{}, nil
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.cache == nil {
+		return s.queryDatabase(ctx, rng, false, false, 0)
+	}
+	if s.cache.boundary == nil {
+		return groupCachedUsage(s.cache.matching(rng)), nil
+	}
+
+	boundary := *s.cache.boundary
+	if rng.Start != nil && !rng.Start.IsZero() && rng.Start.After(boundary) {
+		return groupCachedUsage(s.cache.matching(rng)), nil
+	}
+	// end <= boundary : 缓存只负责 end > boundary
+	if rng.End != nil && !rng.End.IsZero() && !rng.End.After(boundary) {
+		return s.queryDatabase(ctx, rng, false, false, 0)
+	}
+
+	databaseRange := rng
+	databaseRange.End = &boundary
+	result, err := s.queryDatabase(ctx, databaseRange, true, false, 0)
+	if err != nil {
+		return nil, err
+	}
+	appendCachedSegments(result, s.cache.matching(rng))
+	return result, nil
+}
+
+func (s *SQLiteStore) queryDatabase(ctx context.Context, rng QueryRange, endInclusive, descending bool, limit int) (APIUsage, error) {
 	query := `
 SELECT id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
        reasoning_effort, service_tier, latency_ms, ttft_ms,
@@ -243,13 +295,25 @@ FROM usage_records`
 		args = append(args, formatTimestamp(*rng.Start))
 	}
 	if rng.End != nil && !rng.End.IsZero() {
-		where = append(where, "timestamp < ?")
+		operator := "<"
+		if endInclusive {
+			operator = "<="
+		}
+		where = append(where, "timestamp "+operator+" ?")
 		args = append(args, formatTimestamp(*rng.End))
 	}
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
-	query += " ORDER BY timestamp ASC, id ASC"
+	direction := "ASC"
+	if descending {
+		direction = "DESC"
+	}
+	query += " ORDER BY timestamp " + direction + ", id " + direction
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -316,9 +380,102 @@ FROM usage_records`
 	return result, nil
 }
 
+func (s *SQLiteStore) warmCache(ctx context.Context) error {
+	loadLimit := s.cache.capacity + 1
+	usage, err := s.queryDatabase(ctx, QueryRange{}, false, true, loadLimit)
+	if err != nil {
+		return fmt.Errorf("usage sqlite warm cache: %w", err)
+	}
+	records := flattenAPIUsage(usage)
+	sort.Slice(records, func(i, j int) bool { return cachedRecordLess(&records[i], &records[j]) })
+	if len(records) <= s.cache.capacity {
+		s.cache.reset(records, nil)
+		return nil
+	}
+	boundary := records[len(records)-s.cache.capacity-1].detail.Timestamp
+	s.cache.reset(records[len(records)-s.cache.capacity:], &boundary)
+	return nil
+}
+
+func normalizeStoredRecord(record Record) Record {
+	if record.Timestamp.IsZero() {
+		record.Timestamp = time.Now()
+	}
+	record.Timestamp = record.Timestamp.UTC()
+	record.Model = normalizeModel(record.Model)
+	record.LatencyMs = nonNegative(record.LatencyMs)
+	record.TTFTMs = nonNegative(record.TTFTMs)
+	record.Tokens = nonNegativeTokenStats(record.Tokens)
+	record.Tokens.TotalTokens = normalizeTotalTokens(record.Tokens)
+	record.FailureStatusCode = nonNegativeInt(record.FailureStatusCode)
+	return record
+}
+
+func cachedUsageRecordFromRecord(record Record) cachedUsageRecord {
+	return cachedUsageRecord{
+		groupKey: groupingKey(record.APIKey, record.Provider),
+		modelKey: normalizeModel(record.Model),
+		detail: RequestDetail{
+			ID:                record.ID,
+			Timestamp:         record.Timestamp,
+			Provider:          record.Provider,
+			Model:             record.Model,
+			Alias:             record.Alias,
+			Source:            record.Source,
+			AuthID:            record.AuthID,
+			AuthIndex:         record.AuthIndex,
+			AuthType:          record.AuthType,
+			ExecutorType:      record.ExecutorType,
+			ReasoningEffort:   record.ReasoningEffort,
+			ServiceTier:       record.ServiceTier,
+			LatencyMs:         record.LatencyMs,
+			TTFTMs:            record.TTFTMs,
+			Tokens:            record.Tokens,
+			Failed:            record.Failed,
+			FailureStatusCode: record.FailureStatusCode,
+			FailureBody:       record.FailureBody,
+		},
+	}
+}
+
+func flattenAPIUsage(usage APIUsage) []cachedUsageRecord {
+	var records []cachedUsageRecord
+	for groupKey, models := range usage {
+		for modelKey, details := range models {
+			for i := range details {
+				records = append(records, cachedUsageRecord{groupKey: groupKey, modelKey: modelKey, detail: details[i]})
+			}
+		}
+	}
+	return records
+}
+
+func groupCachedUsage(segments cachedUsageSegments) APIUsage {
+	result := APIUsage{}
+	appendCachedSegments(result, segments)
+	return result
+}
+
+func appendCachedSegments(result APIUsage, segments cachedUsageSegments) {
+	appendCachedUsage(result, segments.first)
+	appendCachedUsage(result, segments.second)
+}
+
+func appendCachedUsage(result APIUsage, records []cachedUsageRecord) {
+	for i := range records {
+		record := &records[i]
+		models := result[record.groupKey]
+		if models == nil {
+			models = make(map[string][]RequestDetail)
+			result[record.groupKey] = models
+		}
+		models[record.modelKey] = append(models[record.modelKey], record.detail)
+	}
+}
+
 // Delete removes records by id and reports which ids were absent. The ordered
 // set provides unique IDs and preserves their original order.
-func (s *SQLiteStore) Delete(ctx context.Context, ids *OrderedStringSet) (DeleteResult, error) {
+func (s *SQLiteStore) Delete(ctx context.Context, ids *StableStringSet) (DeleteResult, error) {
 	result := DeleteResult{Missing: []string{}}
 	values := ids.Values()
 	if s == nil || s.db == nil {
@@ -328,6 +485,8 @@ func (s *SQLiteStore) Delete(ctx context.Context, ids *OrderedStringSet) (Delete
 	if len(values) == 0 {
 		return result, nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Use one transaction so all batches require only one database commit.
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -373,6 +532,9 @@ func (s *SQLiteStore) Delete(ctx context.Context, ids *OrderedStringSet) (Delete
 	if err := tx.Commit(); err != nil {
 		return result, fmt.Errorf("usage sqlite commit delete: %w", err)
 	}
+	if s.cache != nil {
+		s.cache.remove(deletedIDs)
+	}
 
 	result.Deleted = int64(len(deletedIDs))
 	if len(deletedIDs) == len(values) {
@@ -392,6 +554,8 @@ func (s *SQLiteStore) DeleteBefore(ctx context.Context, cutoff time.Time) (int64
 	if s == nil || s.db == nil {
 		return 0, nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	res, err := s.db.ExecContext(ctx, "DELETE FROM usage_records WHERE timestamp < ?", formatTimestamp(cutoff))
 	if err != nil {
 		return 0, fmt.Errorf("usage sqlite delete before: %w", err)
@@ -399,6 +563,9 @@ func (s *SQLiteStore) DeleteBefore(ctx context.Context, cutoff time.Time) (int64
 	rows, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("usage sqlite rows affected: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.deleteBefore(cutoff.UTC())
 	}
 	return rows, nil
 }
@@ -408,6 +575,8 @@ func (s *SQLiteStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.db.Close()
 }
 

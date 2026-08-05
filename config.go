@@ -10,17 +10,23 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	defaultCacheSize = 10_000
+	maxCacheSize     = 1_000_000
+)
+
 // pluginConfig holds the plugin-owned settings read from
 // plugins.configs.usage-statistics.
 type pluginConfig struct {
 	DataDir       string
 	RetentionDays int
+	CacheSize     int
 }
 
 // parseConfig reads the plugin config YAML block, accepting English keys and
 // Chinese aliases.
 func parseConfig(raw []byte) pluginConfig {
-	cfg := pluginConfig{}
+	cfg := pluginConfig{CacheSize: defaultCacheSize}
 	if len(raw) == 0 {
 		return cfg
 	}
@@ -34,7 +40,14 @@ func parseConfig(raw []byte) pluginConfig {
 	if v, ok := lookupConfig(m, "retention_days", "用量保留天数"); ok {
 		cfg.RetentionDays = toConfigInt(v)
 	}
+	if v, ok := lookupConfig(m, "cache_size", "缓存大小"); ok {
+		cfg.CacheSize = normalizeCacheSize(toConfigInt(v))
+	}
 	return cfg
+}
+
+func normalizeCacheSize(size int) int {
+	return min(max(size, 0), maxCacheSize)
 }
 
 // resolveDBPath resolves the usage.db path: config data_dir, then the
