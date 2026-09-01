@@ -317,6 +317,102 @@ func TestParseConfig(t *testing.T) {
 	}
 }
 
+func TestSQLiteSchemaHasNoChecksAndGoNormalizesValues(t *testing.T) {
+	store := newTestStore(t)
+	for _, table := range []string{"usage_records", "api_key_safety_state", "api_key_safety_history"} {
+		var schema string
+		if err := store.db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&schema); err != nil {
+			t.Fatalf("query schema for %s: %v", table, err)
+		}
+		if strings.Contains(strings.ToUpper(schema), "CHECK") {
+			t.Fatalf("schema for %s contains CHECK: %s", table, schema)
+		}
+	}
+
+	if err := store.Insert(context.Background(), Record{
+		ID:                "normalized",
+		Timestamp:         time.Now(),
+		LatencyMs:         -1,
+		TTFTMs:            -2,
+		Tokens:            TokenStats{InputTokens: -3, OutputTokens: -4, TotalTokens: -5},
+		FailureStatusCode: -400,
+	}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	var latency, ttft, input, output, total, status int64
+	if err := store.db.QueryRow(`
+SELECT latency_ms, ttft_ms, input_tokens, output_tokens, total_tokens, failure_status_code
+FROM usage_records WHERE id = 'normalized'
+`).Scan(&latency, &ttft, &input, &output, &total, &status); err != nil {
+		t.Fatalf("query normalized values: %v", err)
+	}
+	if latency != 0 || ttft != 0 || input != 0 || output != 0 || total != 0 || status != 0 {
+		t.Fatalf("normalized values = %d %d %d %d %d %d", latency, ttft, input, output, total, status)
+	}
+}
+
+func TestMigrateRemovesSQLiteChecksAndAddsManualDisabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checked.db")
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open old: %v", err)
+	}
+	checkedSchema := strings.Replace(
+		createUsageRecordsSQL,
+		"latency_ms INTEGER NOT NULL DEFAULT 0,",
+		"latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),",
+		1,
+	)
+	if _, err := old.Exec(checkedSchema); err != nil {
+		t.Fatalf("create checked usage table: %v", err)
+	}
+	if _, err := old.Exec("INSERT INTO usage_records (id, timestamp, api_key, model, latency_ms) VALUES (?, ?, ?, ?, ?)", "legacy", 100, "client-key", "model", 7); err != nil {
+		t.Fatalf("insert checked usage: %v", err)
+	}
+	if _, err := old.Exec(`CREATE TABLE api_key_safety_state (
+		api_key TEXT PRIMARY KEY,
+		total_trigger_count INTEGER NOT NULL DEFAULT 0,
+		total_limit_count INTEGER NOT NULL DEFAULT 0,
+		recent_trigger_times BLOB NOT NULL DEFAULT X'',
+		blocked_until INTEGER NOT NULL DEFAULT 0,
+		active_limit_started_at INTEGER NOT NULL DEFAULT 0,
+		active_limit_usage_record_id TEXT NOT NULL DEFAULT ''
+	) WITHOUT ROWID`); err != nil {
+		t.Fatalf("create old safety state: %v", err)
+	}
+	if _, err := old.Exec("INSERT INTO api_key_safety_state (api_key, total_trigger_count) VALUES ('client-key', 1)"); err != nil {
+		t.Fatalf("insert old safety state: %v", err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("close old: %v", err)
+	}
+
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var schema string
+	if err := store.db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_records'").Scan(&schema); err != nil {
+		t.Fatalf("query migrated schema: %v", err)
+	}
+	if strings.Contains(strings.ToUpper(schema), "CHECK") {
+		t.Fatalf("migrated schema contains CHECK: %s", schema)
+	}
+	var latency int64
+	if err := store.db.QueryRow("SELECT latency_ms FROM usage_records WHERE id = 'legacy'").Scan(&latency); err != nil || latency != 7 {
+		t.Fatalf("migrated usage latency = %d, err=%v", latency, err)
+	}
+	states, err := store.LoadSafetyStates(context.Background())
+	if err != nil {
+		t.Fatalf("LoadSafetyStates: %v", err)
+	}
+	state, exists := states["client-key"]
+	if !exists || state.ManualDisabled || state.TotalTriggerCount != 1 {
+		t.Fatalf("migrated safety state = %+v, exists=%v", state, exists)
+	}
+}
+
 // TestMigrateSchemaAddsMissingColumns 验证 schema 自愈：用一个缺少多列的老表
 // 打开 store，NewSQLiteStore 应通过 migrateSchema 补齐所有最新列，且老数据保留、
 // 补列后可正常读写。

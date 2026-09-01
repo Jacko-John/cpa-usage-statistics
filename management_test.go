@@ -162,6 +162,74 @@ func TestSafetyHistoryRouteUsesPost(t *testing.T) {
 	}
 }
 
+func TestSafetyDisabledRoutes(t *testing.T) {
+	var methods []string
+	for _, route := range managementRegistration().Routes {
+		if route.Path == managementSafetyDisabledPath {
+			methods = append(methods, route.Method)
+		}
+	}
+	if len(methods) != 2 || methods[0] != "POST" || methods[1] != "DELETE" {
+		t.Fatalf("safety disabled methods = %v", methods)
+	}
+
+	store := newTestStore(t)
+	limiter := configuredLimiter(t, store, safetyConfig{Threshold: 3, Window: 600, Cooldown: 1800})
+	now := time.Now()
+	if err := limiter.storeUsage(t.Context(), store, cyberRecord("record", "client-key", now), now); err != nil {
+		t.Fatalf("storeUsage: %v", err)
+	}
+	useGlobalSafetyStore(t, limiter, store)
+	body, err := json.Marshal(safetyKeysRequest{APIKeys: []string{" client-key ", "client-key", "missing"}})
+	if err != nil {
+		t.Fatalf("marshal keys: %v", err)
+	}
+
+	disableResponse := callManagementForTest(t, managementRequest{
+		Method: "POST",
+		Path:   "/v0/management" + managementSafetyDisabledPath,
+		Body:   body,
+	})
+	if disableResponse.StatusCode != 200 {
+		t.Fatalf("disable status = %d body=%s", disableResponse.StatusCode, disableResponse.Body)
+	}
+	var disabled SafetyDisableResult
+	if err := json.Unmarshal(disableResponse.Body, &disabled); err != nil {
+		t.Fatalf("unmarshal disable: %v", err)
+	}
+	if len(disabled.Disabled) != 1 || disabled.Disabled[0] != "client-key" || len(disabled.Missing) != 1 || disabled.Missing[0] != "missing" {
+		t.Fatalf("disable response = %+v", disabled)
+	}
+
+	keysResponse := callManagementForTest(t, managementRequest{
+		Method: "GET",
+		Path:   "/v0/management" + managementSafetyKeysPath,
+	})
+	var keys safetyKeysResponse
+	if err := json.Unmarshal(keysResponse.Body, &keys); err != nil {
+		t.Fatalf("unmarshal keys: %v", err)
+	}
+	if len(keys.Keys) != 1 || !keys.Keys[0].ManualDisabled {
+		t.Fatalf("keys response = %+v", keys)
+	}
+
+	enableResponse := callManagementForTest(t, managementRequest{
+		Method: "DELETE",
+		Path:   "/v0/management" + managementSafetyDisabledPath,
+		Body:   body,
+	})
+	if enableResponse.StatusCode != 200 {
+		t.Fatalf("enable status = %d body=%s", enableResponse.StatusCode, enableResponse.Body)
+	}
+	var enabled SafetyEnableResult
+	if err := json.Unmarshal(enableResponse.Body, &enabled); err != nil {
+		t.Fatalf("unmarshal enable: %v", err)
+	}
+	if len(enabled.Enabled) != 1 || enabled.Enabled[0] != "client-key" || len(enabled.Missing) != 1 || enabled.Missing[0] != "missing" {
+		t.Fatalf("enable response = %+v", enabled)
+	}
+}
+
 func TestSafetyManagementRoutes(t *testing.T) {
 	store := newTestStore(t)
 	cfg := safetyConfig{RateLimitEnabled: true, Threshold: 1, Window: 600, Cooldown: 1800}
@@ -247,7 +315,7 @@ func TestSafetyManagementRoutes(t *testing.T) {
 		}
 	}
 
-	releaseBody, err := json.Marshal(releaseSafetyRequest{APIKeys: []string{"client-key"}})
+	releaseBody, err := json.Marshal(safetyKeysRequest{APIKeys: []string{"client-key"}})
 	if err != nil {
 		t.Fatalf("marshal release body: %v", err)
 	}

@@ -6,36 +6,45 @@ import (
 	"strings"
 )
 
+const createUsageRecordsSQL = `CREATE TABLE IF NOT EXISTS usage_records (
+	id TEXT PRIMARY KEY,
+	timestamp INTEGER NOT NULL,
+	api_key TEXT NOT NULL DEFAULT '',
+	provider TEXT NOT NULL DEFAULT '',
+	model TEXT NOT NULL DEFAULT '',
+	alias TEXT NOT NULL DEFAULT '',
+	source TEXT NOT NULL DEFAULT '',
+	auth_id TEXT NOT NULL DEFAULT '',
+	auth_index TEXT NOT NULL DEFAULT '',
+	auth_type TEXT NOT NULL DEFAULT '',
+	executor_type TEXT NOT NULL DEFAULT '',
+	reasoning_effort TEXT NOT NULL DEFAULT '',
+	service_tier TEXT NOT NULL DEFAULT '',
+	latency_ms INTEGER NOT NULL DEFAULT 0,
+	ttft_ms INTEGER NOT NULL DEFAULT 0,
+	input_tokens INTEGER NOT NULL DEFAULT 0,
+	output_tokens INTEGER NOT NULL DEFAULT 0,
+	reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+	cached_tokens INTEGER NOT NULL DEFAULT 0,
+	cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+	cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+	total_tokens INTEGER NOT NULL DEFAULT 0,
+	failed INTEGER NOT NULL DEFAULT 0,
+	failure_status_code INTEGER NOT NULL DEFAULT 0,
+	failure_body TEXT NOT NULL DEFAULT ''
+)`
+
+const usageRecordColumns = `
+	id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
+	reasoning_effort, service_tier, latency_ms, ttft_ms,
+	input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
+	failed, failure_status_code, failure_body
+`
+
 // initSchema 创建当前表、索引，并补齐旧版 usage_records 缺失的列。
 func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	statements := [...]string{
-		`CREATE TABLE IF NOT EXISTS usage_records (
-		id TEXT PRIMARY KEY,
-		timestamp INTEGER NOT NULL,
-		api_key TEXT NOT NULL DEFAULT '',
-		provider TEXT NOT NULL DEFAULT '',
-		model TEXT NOT NULL DEFAULT '',
-		alias TEXT NOT NULL DEFAULT '',
-		source TEXT NOT NULL DEFAULT '',
-		auth_id TEXT NOT NULL DEFAULT '',
-		auth_index TEXT NOT NULL DEFAULT '',
-		auth_type TEXT NOT NULL DEFAULT '',
-		executor_type TEXT NOT NULL DEFAULT '',
-		reasoning_effort TEXT NOT NULL DEFAULT '',
-		service_tier TEXT NOT NULL DEFAULT '',
-		latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
-		ttft_ms INTEGER NOT NULL DEFAULT 0 CHECK (ttft_ms >= 0),
-		input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
-		output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
-		reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK (reasoning_tokens >= 0),
-		cached_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cached_tokens >= 0),
-		cache_read_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_read_tokens >= 0),
-		cache_creation_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_creation_tokens >= 0),
-		total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
-		failed INTEGER NOT NULL DEFAULT 0 CHECK (failed IN (0, 1)),
-		failure_status_code INTEGER NOT NULL DEFAULT 0 CHECK (failure_status_code >= 0),
-		failure_body TEXT NOT NULL DEFAULT ''
-	)`,
+		createUsageRecordsSQL,
 		`CREATE TABLE IF NOT EXISTS api_key_safety_state (
 			api_key TEXT PRIMARY KEY,
 			total_trigger_count INTEGER NOT NULL DEFAULT 0,
@@ -43,7 +52,8 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 			recent_trigger_times BLOB NOT NULL DEFAULT X'',
 			blocked_until INTEGER NOT NULL DEFAULT 0,
 			active_limit_started_at INTEGER NOT NULL DEFAULT 0,
-			active_limit_usage_record_id TEXT NOT NULL DEFAULT ''
+			active_limit_usage_record_id TEXT NOT NULL DEFAULT '',
+			manual_disabled INTEGER NOT NULL DEFAULT 0
 		) WITHOUT ROWID`,
 		`CREATE TABLE IF NOT EXISTS api_key_safety_history (
 			api_key TEXT NOT NULL,
@@ -63,7 +73,13 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	if err := s.migrateSchema(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateSafetyStateSchema(ctx); err != nil {
+		return err
+	}
 	if err := s.migrateUsageTimestamp(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateUsageChecks(ctx); err != nil {
 		return err
 	}
 	return s.initUsageIndexes(ctx)
@@ -129,6 +145,26 @@ func (s *SQLiteStore) migrateSchema(ctx context.Context) error {
 	return nil
 }
 
+func (s *SQLiteStore) migrateSafetyStateSchema(ctx context.Context) error {
+	var exists int
+	if err := s.db.QueryRowContext(
+		ctx,
+		"SELECT COUNT(*) FROM pragma_table_info('api_key_safety_state') WHERE name = 'manual_disabled'",
+	).Scan(&exists); err != nil {
+		return fmt.Errorf("usage sqlite inspect safety state schema: %w", err)
+	}
+	if exists != 0 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `
+ALTER TABLE api_key_safety_state
+ADD COLUMN manual_disabled INTEGER NOT NULL DEFAULT 0
+`); err != nil {
+		return fmt.Errorf("usage sqlite migrate safety state schema: %w", err)
+	}
+	return nil
+}
+
 func (s *SQLiteStore) migrateUsageTimestamp(ctx context.Context) error {
 	var columnType string
 	if err := s.db.QueryRowContext(
@@ -173,6 +209,43 @@ func (s *SQLiteStore) migrateUsageTimestamp(ctx context.Context) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("usage sqlite commit timestamp migration: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) migrateUsageChecks(ctx context.Context) error {
+	var schema string
+	if err := s.db.QueryRowContext(
+		ctx,
+		"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_records'",
+	).Scan(&schema); err != nil {
+		return fmt.Errorf("usage sqlite read usage schema: %w", err)
+	}
+	if !strings.Contains(strings.ToUpper(schema), "CHECK") {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("usage sqlite begin check removal: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, "ALTER TABLE usage_records RENAME TO usage_records_checked"); err != nil {
+		return fmt.Errorf("usage sqlite rename checked table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, createUsageRecordsSQL); err != nil {
+		return fmt.Errorf("usage sqlite create unchecked table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO usage_records ("+usageRecordColumns+") SELECT "+usageRecordColumns+" FROM usage_records_checked",
+	); err != nil {
+		return fmt.Errorf("usage sqlite copy unchecked table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "DROP TABLE usage_records_checked"); err != nil {
+		return fmt.Errorf("usage sqlite drop checked table: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("usage sqlite commit check removal: %w", err)
 	}
 	return nil
 }

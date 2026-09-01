@@ -52,6 +52,8 @@ var registeredManagementRoutes = [...]managementRoute{
 	{Method: "GET", Path: managementSafetyKeysPath, Description: "List API-key safety counters and current limit state."},
 	{Method: "POST", Path: managementSafetyHistoryPath, Description: "Query safety trigger and limit history for one API key."},
 	{Method: "DELETE", Path: managementSafetyLimitsPath, Description: "Release current API-key safety limits."},
+	{Method: "POST", Path: managementSafetyDisabledPath, Description: "Disable recorded API keys."},
+	{Method: "DELETE", Path: managementSafetyDisabledPath, Description: "Enable disabled API keys and release their current safety limits."},
 }
 
 func registerResponse() registerResponsePayload {

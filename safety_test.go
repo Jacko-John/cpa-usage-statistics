@@ -196,6 +196,113 @@ func TestManualReleaseClearsLimitAndMarksHistory(t *testing.T) {
 	}
 }
 
+func TestManualDisablePersistsWithoutAutomaticRateLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	cfg := safetyConfig{RateLimitEnabled: false, Threshold: 3, Window: 600, Cooldown: 1800}
+	limiter := configuredLimiter(t, store, cfg)
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	if err := limiter.storeUsage(context.Background(), store, cyberRecord("record", "client-key", now), now); err != nil {
+		t.Fatalf("storeUsage: %v", err)
+	}
+
+	result, err := limiter.disable(context.Background(), store, []string{"client-key", "missing"}, now)
+	if err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if len(result.Disabled) != 1 || result.Disabled[0] != "client-key" || len(result.Missing) != 1 || result.Missing[0] != "missing" {
+		t.Fatalf("disable result = %+v", result)
+	}
+	result, err = limiter.disable(context.Background(), store, []string{"client-key"}, now)
+	if err != nil || len(result.AlreadyDisabled) != 1 || result.AlreadyDisabled[0] != "client-key" {
+		t.Fatalf("second disable result = %+v, err=%v", result, err)
+	}
+	state := safetyStateForTest(limiter, "client-key")
+	if !state.ManualDisabled || state.TotalTriggerCount != 1 || state.TotalLimitCount != 0 || limiter.disabledCount != 1 {
+		t.Fatalf("disabled state = %+v count=%d", state, limiter.disabledCount)
+	}
+	decision := limiter.inspectRequest(http.Header{"Authorization": {"Bearer client-key"}})
+	if !decision.ManualDisabled || decision.BlockedUntil != 0 {
+		t.Fatalf("disabled decision = %+v", decision)
+	}
+	history, err := store.QuerySafetyHistory(context.Background(), SafetyHistoryQuery{APIKey: "client-key", Limit: 10})
+	if err != nil || len(history) != 1 {
+		t.Fatalf("history after disable = %+v, err=%v", history, err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	reopened, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	restarted := configuredLimiter(t, reopened, cfg)
+	restored := safetyStateForTest(restarted, "client-key")
+	if !restored.ManualDisabled || restarted.disabledCount != 1 {
+		t.Fatalf("restored state = %+v count=%d", restored, restarted.disabledCount)
+	}
+
+	enabled, err := restarted.enable(context.Background(), reopened, []string{"client-key", "missing"}, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	if len(enabled.Enabled) != 1 || enabled.Enabled[0] != "client-key" || len(enabled.Missing) != 1 || enabled.Missing[0] != "missing" {
+		t.Fatalf("enable result = %+v", enabled)
+	}
+	enabled, err = restarted.enable(context.Background(), reopened, []string{"client-key"}, now.Add(time.Minute))
+	if err != nil || len(enabled.AlreadyEnabled) != 1 || enabled.AlreadyEnabled[0] != "client-key" {
+		t.Fatalf("second enable result = %+v, err=%v", enabled, err)
+	}
+}
+
+func TestManualEnableClearsAutomaticLimitWhileReleaseKeepsDisabled(t *testing.T) {
+	store := newTestStore(t)
+	cfg := safetyConfig{RateLimitEnabled: true, Threshold: 1, Window: 600, Cooldown: 1800}
+	limiter := configuredLimiter(t, store, cfg)
+	startedAt := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	for _, apiKey := range []string{"enable-key", "release-key"} {
+		if err := limiter.storeUsage(context.Background(), store, cyberRecord(apiKey+"-record", apiKey, startedAt), startedAt); err != nil {
+			t.Fatalf("storeUsage %s: %v", apiKey, err)
+		}
+	}
+	if _, err := limiter.disable(context.Background(), store, []string{"enable-key", "release-key"}, startedAt); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+
+	enabledAt := startedAt.Add(time.Minute)
+	enabled, err := limiter.enable(context.Background(), store, []string{"enable-key"}, enabledAt)
+	if err != nil || len(enabled.Enabled) != 1 {
+		t.Fatalf("enable result = %+v, err=%v", enabled, err)
+	}
+	enabledState := safetyStateForTest(limiter, "enable-key")
+	if enabledState.ManualDisabled || enabledState.BlockedUntil != 0 || len(enabledState.RecentTriggerTimes) != 0 {
+		t.Fatalf("enabled state = %+v", enabledState)
+	}
+	history, err := store.QuerySafetyHistory(context.Background(), SafetyHistoryQuery{APIKey: "enable-key", Limit: 10})
+	if err != nil || len(history) != 1 || history[0].ManualReleasedAt != enabledAt.Unix() {
+		t.Fatalf("enabled history = %+v, err=%v", history, err)
+	}
+
+	if _, err := limiter.release(context.Background(), store, []string{"release-key"}, enabledAt); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	releasedState := safetyStateForTest(limiter, "release-key")
+	if !releasedState.ManualDisabled || releasedState.BlockedUntil != 0 || limiter.disabledCount != 1 {
+		t.Fatalf("released disabled state = %+v count=%d", releasedState, limiter.disabledCount)
+	}
+	if _, err := limiter.enable(context.Background(), store, []string{"release-key"}, enabledAt); err != nil {
+		t.Fatalf("enable released key: %v", err)
+	}
+	if limiter.disabledCount != 0 {
+		t.Fatalf("disabled count = %d", limiter.disabledCount)
+	}
+}
+
 func TestSafetyHistoryStatus(t *testing.T) {
 	now := int64(1_000)
 	tests := []struct {

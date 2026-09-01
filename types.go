@@ -63,6 +63,7 @@ type SafetyState struct {
 	BlockedUntil             int64
 	ActiveLimitStartedAt     int64
 	ActiveLimitUsageRecordID string
+	ManualDisabled           bool
 }
 
 // SafetyHistory 记录一次 cyber_policy 触发及其可选限流周期。
@@ -89,6 +90,18 @@ type SafetyHistoryQuery struct {
 type SafetyReleaseResult struct {
 	Released   []string `json:"released"`
 	NotBlocked []string `json:"not_blocked"`
+}
+
+type SafetyDisableResult struct {
+	Disabled        []string `json:"disabled"`
+	AlreadyDisabled []string `json:"already_disabled"`
+	Missing         []string `json:"missing"`
+}
+
+type SafetyEnableResult struct {
+	Enabled        []string `json:"enabled"`
+	AlreadyEnabled []string `json:"already_enabled"`
+	Missing        []string `json:"missing"`
 }
 
 // RequestDetail is the outward JSON shape returned by the usage API. It omits

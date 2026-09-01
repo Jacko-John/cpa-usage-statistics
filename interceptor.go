@@ -66,6 +66,9 @@ func interceptRequestBefore(request []byte) ([]byte, error) {
 	case ambiguousAPIKey:
 		return terminatedRequest(req.SourceFormat, http.StatusBadRequest, decision.APIKeyError, "Multiple different API keys were provided.", 0)
 	}
+	if decision.ManualDisabled {
+		return terminatedRequest(req.SourceFormat, http.StatusForbidden, safetyDisabledCode, safetyDisabledMessage, 0)
+	}
 	if decision.BlockedUntil > now {
 		return terminatedRequest(req.SourceFormat, http.StatusTooManyRequests, safetyRateLimitedCode, safetyRateLimitedMessage, decision.BlockedUntil-now)
 	}
@@ -98,6 +101,8 @@ func protocolErrorBody(sourceFormat string, status int, code, message string) ([
 	switch status {
 	case http.StatusUnauthorized:
 		errorType = "authentication_error"
+	case http.StatusForbidden:
+		errorType = "permission_error"
 	case http.StatusTooManyRequests:
 		errorType = "rate_limit_error"
 	}
@@ -112,6 +117,8 @@ func protocolErrorBody(sourceFormat string, status int, code, message string) ([
 		switch status {
 		case http.StatusUnauthorized:
 			geminiStatus = "UNAUTHENTICATED"
+		case http.StatusForbidden:
+			geminiStatus = "PERMISSION_DENIED"
 		case http.StatusTooManyRequests:
 			geminiStatus = "RESOURCE_EXHAUSTED"
 		}

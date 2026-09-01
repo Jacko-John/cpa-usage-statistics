@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-type releaseSafetyRequest struct {
+type safetyKeysRequest struct {
 	APIKeys []string `json:"api_keys"`
 }
 
@@ -92,16 +92,13 @@ func parseSafetyHistoryRequest(raw []byte) (SafetyHistoryQuery, *managementRespo
 	return query, nil
 }
 
-// safetyLimitsDelete 去重并校验 API Key，然后解除其中尚未到期的限制。
-func safetyLimitsDelete(req managementRequest) ([]byte, error) {
-	store := currentStore()
-	if store == nil {
-		return okEnvelope(managementErrorResponse(400, "usage store unavailable"))
-	}
-	var body releaseSafetyRequest
-	if len(req.Body) > 0 {
-		if err := json.Unmarshal(req.Body, &body); err != nil {
-			return okEnvelope(managementErrorResponse(400, "invalid body"))
+// parseSafetyKeysRequest 解析、清理并去重管理请求中的 API Key。
+func parseSafetyKeysRequest(raw []byte) ([]string, *managementResponse) {
+	var body safetyKeysRequest
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &body); err != nil {
+			response := managementErrorResponse(400, "invalid body")
+			return nil, &response
 		}
 	}
 	keys := NewStableStringSet(len(body.APIKeys))
@@ -111,13 +108,65 @@ func safetyLimitsDelete(req managementRequest) ([]byte, error) {
 		}
 	}
 	if keys.Len() == 0 {
-		return okEnvelope(managementErrorResponse(400, "api_keys required"))
+		response := managementErrorResponse(400, "api_keys required")
+		return nil, &response
+	}
+	return keys.Values(), nil
+}
+
+// safetyLimitsDelete 解除指定 API Key 尚未到期的自动限流。
+func safetyLimitsDelete(req managementRequest) ([]byte, error) {
+	store := currentStore()
+	if store == nil {
+		return okEnvelope(managementErrorResponse(400, "usage store unavailable"))
+	}
+	keys, errorResponse := parseSafetyKeysRequest(req.Body)
+	if errorResponse != nil {
+		return okEnvelope(*errorResponse)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
 	defer cancel()
-	result, err := safety.release(ctx, store, keys.Values(), time.Now())
+	result, err := safety.release(ctx, store, keys, time.Now())
 	if err != nil {
 		return okEnvelope(managementErrorResponse(500, "failed to release safety limits"))
+	}
+	return okEnvelope(jsonManagementResponse(200, result))
+}
+
+// safetyDisabledPost 永久禁用已经存在安全状态的 API Key。
+func safetyDisabledPost(req managementRequest) ([]byte, error) {
+	store := currentStore()
+	if store == nil {
+		return okEnvelope(managementErrorResponse(400, "usage store unavailable"))
+	}
+	keys, errorResponse := parseSafetyKeysRequest(req.Body)
+	if errorResponse != nil {
+		return okEnvelope(*errorResponse)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
+	defer cancel()
+	result, err := safety.disable(ctx, store, keys, time.Now())
+	if err != nil {
+		return okEnvelope(managementErrorResponse(500, "failed to disable api keys"))
+	}
+	return okEnvelope(jsonManagementResponse(200, result))
+}
+
+// safetyDisabledDelete 重新启用 API Key，并同时解除其自动限流。
+func safetyDisabledDelete(req managementRequest) ([]byte, error) {
+	store := currentStore()
+	if store == nil {
+		return okEnvelope(managementErrorResponse(400, "usage store unavailable"))
+	}
+	keys, errorResponse := parseSafetyKeysRequest(req.Body)
+	if errorResponse != nil {
+		return okEnvelope(*errorResponse)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
+	defer cancel()
+	result, err := safety.enable(ctx, store, keys, time.Now())
+	if err != nil {
+		return okEnvelope(managementErrorResponse(500, "failed to enable api keys"))
 	}
 	return okEnvelope(jsonManagementResponse(200, result))
 }

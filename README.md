@@ -1,6 +1,6 @@
 # CPA Usage Statistics
 
-CLIProxyAPI 的持久化用量统计插件。插件将请求用量写入本地 SQLite，并提供受管理鉴权保护的查询、删除、安全统计和手动解除限流接口。
+CLIProxyAPI 的持久化用量统计插件。插件将请求用量写入本地 SQLite，并提供受管理鉴权保护的查询、删除、安全统计、手动限流解除和 API Key 禁用接口。
 
 当前版本：`0.2.0`
 
@@ -17,6 +17,7 @@ CLIProxyAPI 的持久化用量统计插件。插件将请求用量写入本地 S
 - 在请求到达上游前按 API Key 执行内存限流检查。
 - 查看安全触发历史和历史限流记录。
 - 手动解除 API Key 的当前限制并清空其滑动窗口。
+- 永久禁用已经记录安全状态的 API Key，并在重新启用时同时解除自动限流。
 
 ## 安装
 
@@ -30,7 +31,7 @@ plugins/darwin/arm64/usage-statistics.dylib
 
 放好后重启 CLIProxyAPI。
 
-安全限流需要宿主支持插件 JSON 消息协议 `schema_version >= 2`。当前检出的 CLIProxyAPI 支持版本 4。
+自动限流和手动禁用需要宿主支持插件 JSON 消息协议 `schema_version >= 2`。当前检出的 CLIProxyAPI 支持版本 4。
 
 ## 配置
 
@@ -60,7 +61,8 @@ plugins:
 
 安全配置规则：
 
-- 安全事件始终记录；`rate_limit_enabled` 只控制是否拦截后续请求。
+- 安全事件始终记录；`rate_limit_enabled` 只控制是否自动拦截后续请求。
+- 手动禁用独立于 `rate_limit_enabled`，重启后继续生效，直到管理员重新启用。
 - `threshold`、`window` 和 `cooldown` 复用已有宽松整数转换：整数字符串可直接解析，数值小数会截断小数部分；转换结果必须大于 0。
 - `window` 和 `cooldown` 的单位为秒；不接受 `10m`、`30s`、`500ms` 等 duration 字符串，也不接受 `"3.5"` 等小数字符串。
 - 安全配置无效时关闭限流，原有用量统计继续工作。
@@ -68,7 +70,7 @@ plugins:
 
 ## API Key 请求头
 
-启用 `rate_limit_enabled` 后，只支持以下请求头：
+启用 `rate_limit_enabled` 或存在手动禁用的 Key 时，插件只从以下请求头提取 API Key：
 
 ```http
 Authorization: Bearer <APIKey>
@@ -164,6 +166,7 @@ GET /v0/management/plugins/usage-statistics/safety/keys
       "total_trigger_count": 8,
       "window_trigger_count": 3,
       "total_limit_count": 2,
+      "manual_disabled": false,
       "blocked": true,
       "blocked_until": 1788177600
     }
@@ -250,14 +253,73 @@ Content-Type: application/json
 
 解除后：
 
-- 请求立即恢复放行。
+- 请求立即恢复放行，除非该 Key 仍处于手动禁用状态。
 - 当前滑动窗口被清空。
 - 历史触发总数和历史限流总数保留。
 - 对应历史行写入 `manual_released_at`。
 
-## 限流响应
+### 手动禁用和重新启用 Key
 
-达到阈值后，该 API Key 的所有模型请求都会在进入上游前被拦截：
+只能操作已经出现在安全状态列表中的 Key。手动禁用不会增加安全触发数、累计限流数或安全历史。
+
+禁用：
+
+```http
+POST /v0/management/plugins/usage-statistics/safety/disabled
+Content-Type: application/json
+
+{"api_keys": ["cpa-client-key-1"]}
+```
+
+```json
+{
+  "disabled": ["cpa-client-key-1"],
+  "already_disabled": [],
+  "missing": []
+}
+```
+
+重新启用：
+
+```http
+DELETE /v0/management/plugins/usage-statistics/safety/disabled
+Content-Type: application/json
+
+{"api_keys": ["cpa-client-key-1"]}
+```
+
+```json
+{
+  "enabled": ["cpa-client-key-1"],
+  "already_enabled": [],
+  "missing": []
+}
+```
+
+手动禁用永久保存并独立于 `rate_limit_enabled`。重新启用时同时清空当前滑动窗口和自动限流；如果自动限流仍在生效，对应历史行会写入 `manual_released_at`。
+
+## 拦截响应
+
+手动禁用的 Key 会在进入上游前收到：
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+```
+
+```json
+{
+  "error": {
+    "type": "permission_error",
+    "code": "api_key_disabled",
+    "message": "This API key has been disabled by an administrator."
+  }
+}
+```
+
+该响应不包含完整 API Key，也不返回 `Retry-After`。
+
+达到自动限流阈值后，该 API Key 的所有模型请求都会在进入上游前被拦截：
 
 ```http
 HTTP/1.1 429 Too Many Requests
@@ -316,7 +378,7 @@ SQLite 新增两张小表：
 请求热路径为：
 
 ```text
-请求头提取 → 内存 Map 查询 → 放行或返回 429
+请求头提取 → 内存 Map 查询 → 放行或返回 403/429
 ```
 
 普通请求限流检查：
@@ -326,7 +388,9 @@ SQLite 新增两张小表：
 - 不读取大型 `usage_records`。
 - 不解码滑动窗口 BLOB。
 
-安全事件会在一个事务中写入用量记录、安全历史和 Key 状态；事务提交成功后才更新内存状态。插件重启时从状态表恢复滑动窗口和未到期限制。
+安全事件会在一个事务中写入用量记录、安全历史和 Key 状态；事务提交成功后才更新内存状态。插件重启时从状态表恢复滑动窗口、未到期限制和手动禁用状态。
+
+SQLite 表不使用 `CHECK` 约束。请求数据写入前由 Go 对延迟、Token、失败状态码等数值执行非负归一化；升级时会一次性重建仍含 `CHECK` 的旧 `usage_records` 表并保留数据。
 
 安全历史、API Key 安全状态及安全历史关联的 `usage_records` 永久保留，不受 `retention_days`、用量保留期清理或按 ID 删除影响。只有未被安全历史关联的用量记录可以删除。
 

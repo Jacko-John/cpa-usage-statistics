@@ -57,6 +57,13 @@ func handleManagement(request []byte) ([]byte, error) {
 		if method == "DELETE" {
 			return safetyLimitsDelete(req)
 		}
+	case managementSafetyDisabledPath:
+		switch method {
+		case "POST":
+			return safetyDisabledPost(req)
+		case "DELETE":
+			return safetyDisabledDelete(req)
+		}
 	default:
 		return okEnvelope(managementErrorResponse(404, "route not found"))
 	}

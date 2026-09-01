@@ -158,6 +158,45 @@ func TestRequestInterceptorReturnsProtocolCompatibleRateLimit(t *testing.T) {
 	}
 }
 
+func TestRequestInterceptorReturnsProtocolCompatibleDisabledError(t *testing.T) {
+	useSafetyLimiter(t, &safetyLimiter{
+		states: map[string]SafetyState{
+			"client-key": {APIKey: "client-key", ManualDisabled: true},
+		},
+		disabledCount: 1,
+	})
+
+	tests := []struct {
+		format string
+		marker string
+	}{
+		{format: "openai", marker: `"code":"api_key_disabled"`},
+		{format: "openai-response", marker: `"type":"permission_error"`},
+		{format: "claude", marker: `"type":"permission_error"`},
+		{format: "gemini", marker: `"status":"PERMISSION_DENIED"`},
+	}
+	for _, test := range tests {
+		t.Run(test.format, func(t *testing.T) {
+			response := interceptForTest(t, requestInterceptRequest{
+				SourceFormat: test.format,
+				Headers:      http.Header{"Authorization": {"Bearer client-key"}},
+			})
+			if !response.Terminate || response.StatusCode != http.StatusForbidden {
+				t.Fatalf("response = %+v", response)
+			}
+			if response.ResponseHeaders.Get("Retry-After") != "" {
+				t.Fatalf("Retry-After = %q", response.ResponseHeaders.Get("Retry-After"))
+			}
+			if !bytes.Contains(response.ResponseBody, []byte(test.marker)) {
+				t.Fatalf("body = %s, want marker %s", response.ResponseBody, test.marker)
+			}
+			if bytes.Contains(response.ResponseBody, []byte("client-key")) {
+				t.Fatalf("response leaked API key: %s", response.ResponseBody)
+			}
+		})
+	}
+}
+
 func TestRequestInterceptorDisabledIsNoOp(t *testing.T) {
 	useSafetyLimiter(t, &safetyLimiter{
 		config: safetyConfig{RateLimitEnabled: false},

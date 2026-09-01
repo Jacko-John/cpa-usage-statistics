@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 )
@@ -40,15 +41,17 @@ INSERT INTO api_key_safety_state (
 	recent_trigger_times,
 	blocked_until,
 	active_limit_started_at,
-	active_limit_usage_record_id
-) VALUES (?, ?, ?, ?, ?, ?, ?)
+	active_limit_usage_record_id,
+	manual_disabled
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(api_key) DO UPDATE SET
 	total_trigger_count          = excluded.total_trigger_count,
 	total_limit_count            = excluded.total_limit_count,
 	recent_trigger_times         = excluded.recent_trigger_times,
 	blocked_until                = excluded.blocked_until,
 	active_limit_started_at      = excluded.active_limit_started_at,
-	active_limit_usage_record_id = excluded.active_limit_usage_record_id
+	active_limit_usage_record_id = excluded.active_limit_usage_record_id,
+	manual_disabled             = excluded.manual_disabled
 `,
 		state.APIKey,
 		state.TotalTriggerCount,
@@ -57,6 +60,7 @@ ON CONFLICT(api_key) DO UPDATE SET
 		state.BlockedUntil,
 		state.ActiveLimitStartedAt,
 		state.ActiveLimitUsageRecordID,
+		state.ManualDisabled,
 	); err != nil {
 		return fmt.Errorf("usage sqlite upsert safety state: %w", err)
 	}
@@ -80,7 +84,8 @@ SELECT
 	recent_trigger_times,
 	blocked_until,
 	active_limit_started_at,
-	active_limit_usage_record_id
+	active_limit_usage_record_id,
+	manual_disabled
 FROM api_key_safety_state
 `)
 	if err != nil {
@@ -100,6 +105,7 @@ FROM api_key_safety_state
 			&state.BlockedUntil,
 			&state.ActiveLimitStartedAt,
 			&state.ActiveLimitUsageRecordID,
+			&state.ManualDisabled,
 		); err != nil {
 			return nil, fmt.Errorf("usage sqlite scan safety state: %w", err)
 		}
@@ -139,7 +145,54 @@ func (s *SQLiteStore) ReleaseSafetyLimits(ctx context.Context, states []SafetySt
 	}
 	defer func() { _ = tx.Rollback() }()
 	for _, state := range states {
-		if _, err := tx.ExecContext(ctx, `
+		if err := markSafetyLimitReleased(ctx, tx, state, releasedAt); err != nil {
+			return err
+		}
+		if err := clearSafetyLimit(ctx, tx, state.APIKey, state.ManualDisabled); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("usage sqlite commit safety release: %w", err)
+	}
+	return nil
+}
+
+// SetManualDisabled 持久化手动禁用状态；启用时同时解除当前自动限流。
+func (s *SQLiteStore) SetManualDisabled(ctx context.Context, states []SafetyState, disabled bool, now int64) error {
+	if s == nil || s.db == nil || len(states) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("usage sqlite begin manual disable update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, state := range states {
+		if disabled {
+			if _, err := tx.ExecContext(ctx, "UPDATE api_key_safety_state SET manual_disabled = 1 WHERE api_key = ?", state.APIKey); err != nil {
+				return fmt.Errorf("usage sqlite disable api key: %w", err)
+			}
+			continue
+		}
+		if state.BlockedUntil > now {
+			if err := markSafetyLimitReleased(ctx, tx, state, now); err != nil {
+				return err
+			}
+		}
+		if err := clearSafetyLimit(ctx, tx, state.APIKey, false); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("usage sqlite commit manual disable update: %w", err)
+	}
+	return nil
+}
+
+func markSafetyLimitReleased(ctx context.Context, tx *sql.Tx, state SafetyState, releasedAt int64) error {
+	if _, err := tx.ExecContext(ctx, `
 UPDATE api_key_safety_history
 SET manual_released_at = ?
 WHERE api_key = ?
@@ -148,21 +201,22 @@ WHERE api_key = ?
   AND blocked_until > 0
   AND manual_released_at = 0
 `, releasedAt, state.APIKey, state.ActiveLimitStartedAt, state.ActiveLimitUsageRecordID); err != nil {
-			return fmt.Errorf("usage sqlite release safety history: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `
+		return fmt.Errorf("usage sqlite release safety history: %w", err)
+	}
+	return nil
+}
+
+func clearSafetyLimit(ctx context.Context, tx *sql.Tx, apiKey string, manualDisabled bool) error {
+	if _, err := tx.ExecContext(ctx, `
 UPDATE api_key_safety_state
 SET recent_trigger_times = X'',
     blocked_until = 0,
     active_limit_started_at = 0,
-    active_limit_usage_record_id = ''
+    active_limit_usage_record_id = '',
+    manual_disabled = ?
 WHERE api_key = ?
-`, state.APIKey); err != nil {
-			return fmt.Errorf("usage sqlite release safety state: %w", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("usage sqlite commit safety release: %w", err)
+`, manualDisabled, apiKey); err != nil {
+		return fmt.Errorf("usage sqlite clear safety state: %w", err)
 	}
 	return nil
 }

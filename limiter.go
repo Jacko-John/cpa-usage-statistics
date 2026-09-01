@@ -12,13 +12,16 @@ import (
 const (
 	safetyRateLimitedCode    = "safety_rate_limited"
 	safetyRateLimitedMessage = "Too many requests were rejected by the upstream safety policy. Retry later."
+	safetyDisabledCode       = "api_key_disabled"
+	safetyDisabledMessage    = "This API key has been disabled by an administrator."
 )
 
 type safetyLimiter struct {
-	mu         sync.RWMutex
-	config     safetyConfig
-	states     map[string]SafetyState
-	configured bool
+	mu            sync.RWMutex
+	config        safetyConfig
+	states        map[string]SafetyState
+	disabledCount int
+	configured    bool
 }
 
 var safety = &safetyLimiter{states: make(map[string]SafetyState)}
@@ -37,9 +40,16 @@ func (l *safetyLimiter) configure(ctx context.Context, store *SQLiteStore, cfg s
 	if err != nil {
 		return err
 	}
+	disabledCount := 0
+	for _, state := range states {
+		if state.ManualDisabled {
+			disabledCount++
+		}
+	}
 	cfg.RateLimitEnabled = cfg.RateLimitEnabled && interceptionSupported
 	l.config = cfg
 	l.states = states
+	l.disabledCount = disabledCount
 	l.configured = true
 	return nil
 }
@@ -98,21 +108,27 @@ func appendTriggerTime(times []int64, cutoff, now int64) []int64 {
 }
 
 type requestSafetyDecision struct {
-	APIKeyError  string
-	BlockedUntil int64
+	APIKeyError    string
+	ManualDisabled bool
+	BlockedUntil   int64
 }
 
 func (l *safetyLimiter) inspectRequest(headers http.Header) requestSafetyDecision {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	if !l.config.RateLimitEnabled {
+	if !l.config.RateLimitEnabled && l.disabledCount == 0 {
 		return requestSafetyDecision{}
 	}
 	apiKey, errorCode := extractAPIKey(headers)
 	if errorCode != "" {
 		return requestSafetyDecision{APIKeyError: errorCode}
 	}
-	return requestSafetyDecision{BlockedUntil: l.states[apiKey].BlockedUntil}
+	state := l.states[apiKey]
+	decision := requestSafetyDecision{ManualDisabled: state.ManualDisabled}
+	if l.config.RateLimitEnabled {
+		decision.BlockedUntil = state.BlockedUntil
+	}
+	return decision
 }
 
 type safetyKeyStatus struct {
@@ -120,6 +136,7 @@ type safetyKeyStatus struct {
 	TotalTriggerCount  int64  `json:"total_trigger_count"`
 	WindowTriggerCount int    `json:"window_trigger_count"`
 	TotalLimitCount    int64  `json:"total_limit_count"`
+	ManualDisabled     bool   `json:"manual_disabled"`
 	Blocked            bool   `json:"blocked"`
 	BlockedUntil       int64  `json:"blocked_until"`
 }
@@ -143,6 +160,7 @@ func (l *safetyLimiter) keyStatuses(now time.Time) []safetyKeyStatus {
 			TotalTriggerCount:  state.TotalTriggerCount,
 			WindowTriggerCount: windowCount,
 			TotalLimitCount:    state.TotalLimitCount,
+			ManualDisabled:     state.ManualDisabled,
 			Blocked:            state.BlockedUntil > nowUnix,
 			BlockedUntil:       state.BlockedUntil,
 		})
@@ -187,6 +205,77 @@ func (l *safetyLimiter) release(ctx context.Context, store *SQLiteStore, apiKeys
 		state.ActiveLimitUsageRecordID = ""
 		l.states[state.APIKey] = state
 	}
+	return result, nil
+}
+
+func (l *safetyLimiter) disable(ctx context.Context, store *SQLiteStore, apiKeys []string, now time.Time) (SafetyDisableResult, error) {
+	result := SafetyDisableResult{
+		Disabled:        make([]string, 0, len(apiKeys)),
+		AlreadyDisabled: make([]string, 0, len(apiKeys)),
+		Missing:         make([]string, 0, len(apiKeys)),
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	states := make([]SafetyState, 0, len(apiKeys))
+	for _, apiKey := range apiKeys {
+		state, exists := l.states[apiKey]
+		switch {
+		case !exists:
+			result.Missing = append(result.Missing, apiKey)
+		case state.ManualDisabled:
+			result.AlreadyDisabled = append(result.AlreadyDisabled, apiKey)
+		default:
+			states = append(states, state)
+			result.Disabled = append(result.Disabled, apiKey)
+		}
+	}
+	if err := store.SetManualDisabled(ctx, states, true, now.Unix()); err != nil {
+		return SafetyDisableResult{}, err
+	}
+	for _, state := range states {
+		state.ManualDisabled = true
+		l.states[state.APIKey] = state
+	}
+	l.disabledCount += len(states)
+	return result, nil
+}
+
+func (l *safetyLimiter) enable(ctx context.Context, store *SQLiteStore, apiKeys []string, now time.Time) (SafetyEnableResult, error) {
+	result := SafetyEnableResult{
+		Enabled:        make([]string, 0, len(apiKeys)),
+		AlreadyEnabled: make([]string, 0, len(apiKeys)),
+		Missing:        make([]string, 0, len(apiKeys)),
+	}
+	nowUnix := now.Unix()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	states := make([]SafetyState, 0, len(apiKeys))
+	for _, apiKey := range apiKeys {
+		state, exists := l.states[apiKey]
+		switch {
+		case !exists:
+			result.Missing = append(result.Missing, apiKey)
+		case !state.ManualDisabled:
+			result.AlreadyEnabled = append(result.AlreadyEnabled, apiKey)
+		default:
+			states = append(states, state)
+			result.Enabled = append(result.Enabled, apiKey)
+		}
+	}
+	if err := store.SetManualDisabled(ctx, states, false, nowUnix); err != nil {
+		return SafetyEnableResult{}, err
+	}
+	for _, state := range states {
+		state.ManualDisabled = false
+		state.RecentTriggerTimes = nil
+		state.BlockedUntil = 0
+		state.ActiveLimitStartedAt = 0
+		state.ActiveLimitUsageRecordID = ""
+		l.states[state.APIKey] = state
+	}
+	l.disabledCount -= len(states)
 	return result, nil
 }
 
