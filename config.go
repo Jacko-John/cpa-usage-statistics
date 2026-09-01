@@ -11,47 +11,99 @@ import (
 )
 
 const (
-	defaultCacheSize = 10_000
-	maxCacheSize     = 1_000_000
+	defaultSafetyThreshold = int64(3)
+	defaultSafetyWindow    = int64(600)
+	defaultSafetyCooldown  = int64(1800)
 )
 
-// pluginConfig holds the plugin-owned settings read from
-// plugins.configs.usage-statistics.
+// pluginConfig 保存 plugins.configs.usage-statistics 下的插件配置。
 type pluginConfig struct {
 	DataDir       string
 	RetentionDays int
-	CacheSize     int
+	Safety        safetyConfig
 }
 
-// parseConfig reads the plugin config YAML block, accepting English keys and
-// Chinese aliases.
+type safetyConfig struct {
+	RateLimitEnabled bool
+	Threshold        int64
+	Window           int64
+	Cooldown         int64
+}
+
+func defaultSafetyConfig() safetyConfig {
+	return safetyConfig{
+		Threshold: defaultSafetyThreshold,
+		Window:    defaultSafetyWindow,
+		Cooldown:  defaultSafetyCooldown,
+	}
+}
+
+// parseConfig 解析插件 YAML 配置并兼容中文别名。
 func parseConfig(raw []byte) pluginConfig {
-	cfg := pluginConfig{CacheSize: defaultCacheSize}
-	if len(raw) == 0 {
+	cfg := pluginConfig{Safety: defaultSafetyConfig()}
+	var values map[string]any
+	if err := yaml.Unmarshal(raw, &values); err != nil {
 		return cfg
 	}
-	var m map[string]any
-	if err := yaml.Unmarshal(raw, &m); err != nil || m == nil {
-		return cfg
+	if value, ok := lookupConfig(values, "data_dir", "数据目录"); ok {
+		cfg.DataDir = strings.TrimSpace(toConfigString(value))
 	}
-	if v, ok := lookupConfig(m, "data_dir", "数据目录"); ok {
-		cfg.DataDir = strings.TrimSpace(toConfigString(v))
+	if value, ok := lookupConfig(values, "retention_days", "用量保留天数"); ok {
+		cfg.RetentionDays = toConfigInt(value)
 	}
-	if v, ok := lookupConfig(m, "retention_days", "用量保留天数"); ok {
-		cfg.RetentionDays = toConfigInt(v)
-	}
-	if v, ok := lookupConfig(m, "cache_size", "缓存大小"); ok {
-		cfg.CacheSize = normalizeCacheSize(toConfigInt(v))
-	}
+	cfg.Safety = parseSafetyConfig(values)
 	return cfg
 }
 
-func normalizeCacheSize(size int) int {
-	return min(max(size, 0), maxCacheSize)
+func parseSafetyConfig(values map[string]any) safetyConfig {
+	cfg := defaultSafetyConfig()
+	rateLimitValid := setConfigBool(values, "rate_limit_enabled", "启用限流", &cfg.RateLimitEnabled)
+	thresholdValid := setPositiveConfigInteger(values, "threshold", "触发阈值", &cfg.Threshold)
+	windowValid := setPositiveConfigInteger(values, "window", "滑动窗口秒数", &cfg.Window)
+	cooldownValid := setPositiveConfigInteger(values, "cooldown", "限流时长秒数", &cfg.Cooldown)
+
+	valid := rateLimitValid && thresholdValid && windowValid && cooldownValid
+	cfg.RateLimitEnabled = valid && cfg.RateLimitEnabled
+	return cfg
 }
 
-// resolveDBPath resolves the usage.db path: config data_dir, then the
-// USAGE_STATISTICS_DIR env var, then a cross-platform home-based default.
+func setConfigBool(values map[string]any, key, alias string, target *bool) bool {
+	raw, exists := lookupConfig(values, key, alias)
+	if !exists {
+		return true
+	}
+	switch value := raw.(type) {
+	case bool:
+		*target = value
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return false
+		}
+		*target = parsed
+	default:
+		return false
+	}
+	return true
+}
+
+func setPositiveConfigInteger(values map[string]any, key, alias string, target *int64) bool {
+	raw, exists := lookupConfig(values, key, alias)
+	if !exists {
+		return true
+	}
+	value, valid := normalizePositiveConfigInt(toConfigInt(raw))
+	if valid {
+		*target = value
+	}
+	return valid
+}
+
+func normalizePositiveConfigInt(value int) (int64, bool) {
+	return int64(value), value > 0
+}
+
+// resolveDBPath 按配置目录、环境变量、用户主目录的顺序确定 usage.db 路径。
 func resolveDBPath(cfg pluginConfig) (string, error) {
 	dir := strings.TrimSpace(cfg.DataDir)
 	if dir == "" {
@@ -70,24 +122,19 @@ func resolveDBPath(cfg pluginConfig) (string, error) {
 	return filepath.Join(dir, "usage.db"), nil
 }
 
-func lookupConfig(m map[string]any, keys ...string) (any, bool) {
-	for _, key := range keys {
-		if v, ok := m[key]; ok {
-			return v, true
-		}
+func lookupConfig(values map[string]any, key, alias string) (any, bool) {
+	if value, ok := values[key]; ok {
+		return value, true
 	}
-	return nil, false
+	value, ok := values[alias]
+	return value, ok
 }
 
-func toConfigString(v any) string {
-	switch s := v.(type) {
-	case nil:
+func toConfigString(value any) string {
+	if value == nil {
 		return ""
-	case string:
-		return s
-	default:
-		return fmt.Sprintf("%v", v)
 	}
+	return fmt.Sprint(value)
 }
 
 func toConfigInt(v any) int {

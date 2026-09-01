@@ -56,6 +56,89 @@ func newTestStore(t *testing.T) *SQLiteStore {
 	return store
 }
 
+func TestSQLiteUsesWALAndUsageQueryIndex(t *testing.T) {
+	store := newTestStore(t)
+
+	var journalMode string
+	if err := store.db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatalf("query journal mode: %v", err)
+	}
+	if journalMode != "wal" {
+		t.Fatalf("journal mode = %q, want wal", journalMode)
+	}
+
+	indexes := map[string]bool{}
+	rows, err := store.db.Query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_records'")
+	if err != nil {
+		t.Fatalf("query usage indexes: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan usage index: %v", err)
+		}
+		indexes[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("usage index rows: %v", err)
+	}
+	if !indexes["idx_usage_records_timestamp_id"] {
+		t.Fatalf("usage indexes = %v", indexes)
+	}
+	if indexes["idx_usage_records_timestamp"] || indexes["idx_usage_records_api_model"] {
+		t.Fatalf("redundant usage indexes remain: %v", indexes)
+	}
+}
+
+func TestUsageTimestampUsesUnixSeconds(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 9, 1, 12, 0, 0, 250_000_000, time.UTC)
+	for _, record := range []Record{
+		{ID: "first", Timestamp: base, APIKey: "k", Model: "m"},
+		{ID: "second", Timestamp: base.Add(1500 * time.Millisecond), APIKey: "k", Model: "m"},
+	} {
+		if err := store.Insert(ctx, record); err != nil {
+			t.Fatalf("Insert %s: %v", record.ID, err)
+		}
+	}
+
+	var storageType string
+	var storedTimestamp int64
+	if err := store.db.QueryRow(
+		"SELECT typeof(timestamp), timestamp FROM usage_records WHERE id = ?",
+		"first",
+	).Scan(&storageType, &storedTimestamp); err != nil {
+		t.Fatalf("query stored timestamp: %v", err)
+	}
+	if storageType != "integer" || storedTimestamp != base.Unix() {
+		t.Fatalf("stored timestamp: type=%q value=%d", storageType, storedTimestamp)
+	}
+
+	start := time.Unix(base.Unix(), 500_000_000).UTC()
+	end := time.Unix(base.Unix()+1, 500_000_000).UTC()
+	usage, err := store.Query(ctx, QueryRange{Start: &start, End: &end})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	details := usage["k"]["m"]
+	if len(details) != 1 || details[0].ID != "second" || details[0].Timestamp.Unix() != base.Unix()+1 || details[0].Timestamp.Nanosecond() != 0 {
+		t.Fatalf("range details = %+v", details)
+	}
+	encoded, err := json.Marshal(details[0])
+	if err != nil {
+		t.Fatalf("marshal detail: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatalf("unmarshal detail: %v", err)
+	}
+	if _, ok := payload["timestamp"].(string); !ok {
+		t.Fatalf("timestamp JSON is not RFC3339 string: %s", encoded)
+	}
+}
+
 func TestInsertQueryDelete(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -167,130 +250,6 @@ func TestQueryFiltersByRange(t *testing.T) {
 	}
 }
 
-func TestCacheSupplementsDatabaseAcrossTimestampBoundary(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage.db")
-	store, err := NewSQLiteStore(path)
-	if err != nil {
-		t.Fatalf("NewSQLiteStore: %v", err)
-	}
-	ctx := context.Background()
-	base := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
-	records := []Record{
-		{ID: "old", Timestamp: base, APIKey: "k", Model: "m"},
-		{ID: "same-a", Timestamp: base.Add(time.Minute), APIKey: "k", Model: "m"},
-		{ID: "same-b", Timestamp: base.Add(time.Minute), APIKey: "k", Model: "m"},
-		{ID: "new", Timestamp: base.Add(2 * time.Minute), APIKey: "k", Model: "m"},
-	}
-	for i := range records {
-		if err := store.Insert(ctx, records[i]); err != nil {
-			t.Fatalf("Insert %s: %v", records[i].ID, err)
-		}
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	store, err = NewSQLiteStoreWithCache(path, 2)
-	if err != nil {
-		t.Fatalf("NewSQLiteStoreWithCache: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	if store.cache.boundary == nil || store.cache.count != 2 {
-		t.Fatalf("cache state: boundary=%v count=%d", store.cache.boundary, store.cache.count)
-	}
-
-	usage, err := store.Query(ctx, QueryRange{})
-	if err != nil {
-		t.Fatalf("Query: %v", err)
-	}
-	details := usage["k"]["m"]
-	got := make([]string, len(details))
-	for i, detail := range details {
-		got[i] = detail.ID
-	}
-	if want := []string{"old", "same-a", "same-b", "new"}; !slices.Equal(got, want) {
-		t.Fatalf("ids = %v, want %v", got, want)
-	}
-
-	// A range strictly after the database boundary is served entirely by cache.
-	start := base.Add(time.Minute + time.Nanosecond)
-	if err := store.db.Close(); err != nil {
-		t.Fatalf("close database: %v", err)
-	}
-	usage, err = store.Query(ctx, QueryRange{Start: &start})
-	if err != nil {
-		t.Fatalf("cached range Query: %v", err)
-	}
-	if details := usage["k"]["m"]; len(details) != 1 || details[0].ID != "new" {
-		t.Fatalf("cached range usage = %+v", usage)
-	}
-}
-
-func TestCacheSynchronizesInsertDeleteAndDeleteBefore(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage.db")
-	store, err := NewSQLiteStoreWithCache(path, 2)
-	if err != nil {
-		t.Fatalf("NewSQLiteStoreWithCache: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	ctx := context.Background()
-	base := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
-	for i, id := range []string{"one", "two", "three"} {
-		if err := store.Insert(ctx, Record{ID: id, Timestamp: base.Add(time.Duration(i) * time.Minute), APIKey: "k", Model: "m"}); err != nil {
-			t.Fatalf("Insert %s: %v", id, err)
-		}
-	}
-	if store.cache.boundary == nil || store.cache.count != 2 {
-		t.Fatalf("cache after insert: boundary=%v count=%d", store.cache.boundary, store.cache.count)
-	}
-
-	ids := NewStableStringSet(1)
-	ids.Add("three")
-	if _, err := store.Delete(ctx, ids); err != nil {
-		t.Fatalf("Delete: %v", err)
-	}
-	if store.cache.count != 1 || store.cache.record(0).detail.ID != "two" {
-		t.Fatalf("cache after delete: count=%d", store.cache.count)
-	}
-
-	cutoff := base.Add(30 * time.Second)
-	if _, err := store.DeleteBefore(ctx, cutoff); err != nil {
-		t.Fatalf("DeleteBefore: %v", err)
-	}
-	if store.cache.boundary != nil || store.cache.count != 1 {
-		t.Fatalf("cache after cleanup: boundary=%v count=%d", store.cache.boundary, store.cache.count)
-	}
-	usage, err := store.Query(ctx, QueryRange{})
-	if err != nil {
-		t.Fatalf("Query: %v", err)
-	}
-	if details := usage["k"]["m"]; len(details) != 1 || details[0].ID != "two" {
-		t.Fatalf("usage after cache sync = %+v", usage)
-	}
-}
-
-func TestCompleteCacheServesQueryAfterDatabaseClose(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage.db")
-	store, err := NewSQLiteStoreWithCache(path, 2)
-	if err != nil {
-		t.Fatalf("NewSQLiteStoreWithCache: %v", err)
-	}
-	ctx := context.Background()
-	if err := store.Insert(ctx, Record{ID: "cached", Timestamp: time.Now(), APIKey: "k", Model: "m"}); err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-	if err := store.db.Close(); err != nil {
-		t.Fatalf("close database: %v", err)
-	}
-	usage, err := store.Query(ctx, QueryRange{})
-	if err != nil {
-		t.Fatalf("cached Query: %v", err)
-	}
-	if details := usage["k"]["m"]; len(details) != 1 || details[0].ID != "cached" {
-		t.Fatalf("cached usage = %+v", usage)
-	}
-}
-
 func TestDeleteBefore(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -344,32 +303,17 @@ func TestToRecordMapping(t *testing.T) {
 }
 
 func TestParseConfig(t *testing.T) {
-	cfg := parseConfig([]byte("enabled: true\npriority: 120\ndata_dir: /tmp/usage\nretention_days: 45\ncache_size: 256\n"))
+	cfg := parseConfig([]byte("enabled: true\npriority: 120\ndata_dir: /tmp/usage\nretention_days: 45\n"))
 	if cfg.DataDir != "/tmp/usage" {
 		t.Fatalf("data_dir = %q", cfg.DataDir)
 	}
 	if cfg.RetentionDays != 45 {
 		t.Fatalf("retention_days = %d", cfg.RetentionDays)
 	}
-	if cfg.CacheSize != 256 {
-		t.Fatalf("cache_size = %d", cfg.CacheSize)
-	}
 
-	zh := parseConfig([]byte("用量保留天数: 7\n缓存大小: 128\n"))
+	zh := parseConfig([]byte("用量保留天数: 7\n"))
 	if zh.RetentionDays != 7 {
 		t.Fatalf("chinese retention = %d", zh.RetentionDays)
-	}
-	if zh.CacheSize != 128 {
-		t.Fatalf("chinese cache size = %d", zh.CacheSize)
-	}
-
-	maximum := parseConfig([]byte("cache_size: 1000001\n"))
-	if maximum.CacheSize != maxCacheSize {
-		t.Fatalf("maximum cache size = %d, want %d", maximum.CacheSize, maxCacheSize)
-	}
-	minimum := parseConfig([]byte("cache_size: -1\n"))
-	if minimum.CacheSize != 0 {
-		t.Fatalf("minimum cache size = %d, want 0", minimum.CacheSize)
 	}
 }
 
@@ -402,7 +346,7 @@ func TestMigrateSchemaAddsMissingColumns(t *testing.T) {
 		t.Fatalf("create old table: %v", err)
 	}
 	if _, err := old.Exec(`INSERT INTO usage_records (id, timestamp, api_key, model, input_tokens, total_tokens) VALUES (?, ?, ?, ?, ?, ?)`,
-		"legacy-1", "2026-05-02T10:30:00.000000000Z", "k", "m", 11, 11); err != nil {
+		"legacy-1", "2026-05-02T10:30:00.999999999Z", "k", "m", 11, 11); err != nil {
 		t.Fatalf("insert legacy: %v", err)
 	}
 	_ = old.Close()
@@ -427,6 +371,31 @@ func TestMigrateSchemaAddsMissingColumns(t *testing.T) {
 	} {
 		if _, ok := cols[want]; !ok {
 			t.Fatalf("column %q not added by migrateSchema", want)
+		}
+	}
+
+	var timestampType string
+	if err := store.db.QueryRow(
+		"SELECT type FROM pragma_table_info('usage_records') WHERE name = 'timestamp'",
+	).Scan(&timestampType); err != nil {
+		t.Fatalf("query timestamp type: %v", err)
+	}
+	var migratedTimestamp int64
+	if err := store.db.QueryRow("SELECT timestamp FROM usage_records WHERE id = 'legacy-1'").Scan(&migratedTimestamp); err != nil {
+		t.Fatalf("query migrated timestamp: %v", err)
+	}
+	wantTimestamp := time.Date(2026, 5, 2, 10, 30, 0, 0, time.UTC).Unix()
+	if timestampType != "INTEGER" || migratedTimestamp != wantTimestamp {
+		t.Fatalf("migrated timestamp: type=%q value=%d want=%d", timestampType, migratedTimestamp, wantTimestamp)
+	}
+
+	for _, table := range []string{"api_key_safety_state", "api_key_safety_history"} {
+		var count int
+		if err := store.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&count); err != nil {
+			t.Fatalf("query safety table %s: %v", table, err)
+		}
+		if count != 1 {
+			t.Fatalf("safety table %s was not created during migration", table)
 		}
 	}
 

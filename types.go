@@ -1,6 +1,9 @@
 package main
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // TokenStats holds token accounting for one request, aligned with upstream
 // usage.Detail field semantics.
@@ -12,6 +15,19 @@ type TokenStats struct {
 	CacheReadTokens     int64 `json:"cache_read_tokens"`
 	CacheCreationTokens int64 `json:"cache_creation_tokens"`
 	TotalTokens         int64 `json:"total_tokens"`
+}
+
+type failureBody string
+
+func (body failureBody) MarshalJSON() ([]byte, error) {
+	if body == "" {
+		return []byte("null"), nil
+	}
+	raw := []byte(body)
+	if json.Valid(raw) {
+		return raw, nil
+	}
+	return json.Marshal(string(body))
 }
 
 // Record is one persisted usage row. Column names mirror upstream
@@ -38,27 +54,64 @@ type Record struct {
 	FailureBody       string
 }
 
+// SafetyState 是一个下游 API Key 的持久化与内存状态。
+type SafetyState struct {
+	APIKey                   string
+	TotalTriggerCount        int64
+	TotalLimitCount          int64
+	RecentTriggerTimes       []int64
+	BlockedUntil             int64
+	ActiveLimitStartedAt     int64
+	ActiveLimitUsageRecordID string
+}
+
+// SafetyHistory 记录一次 cyber_policy 触发及其可选限流周期。
+type SafetyHistory struct {
+	APIKey            string      `json:"api_key"`
+	OccurredAt        int64       `json:"occurred_at"`
+	UsageRecordID     string      `json:"usage_record_id"`
+	BlockedUntil      int64       `json:"blocked_until"`
+	ManualReleasedAt  int64       `json:"manual_released_at"`
+	Provider          string      `json:"provider"`
+	Model             string      `json:"model"`
+	FailureStatusCode int         `json:"failure_status_code"`
+	FailureBody       failureBody `json:"failure_body"`
+}
+
+type SafetyHistoryQuery struct {
+	APIKey      string
+	BlockedOnly bool
+	BeforeTime  int64
+	BeforeID    string
+	Limit       int
+}
+
+type SafetyReleaseResult struct {
+	Released   []string `json:"released"`
+	NotBlocked []string `json:"not_blocked"`
+}
+
 // RequestDetail is the outward JSON shape returned by the usage API. It omits
 // storage-only grouping fields (api_key/model live in the map keys).
 type RequestDetail struct {
-	ID                string     `json:"id"`
-	Timestamp         time.Time  `json:"timestamp"`
-	Provider          string     `json:"provider,omitempty"`
-	Model             string     `json:"model,omitempty"`
-	Alias             string     `json:"alias,omitempty"`
-	Source            string     `json:"source"`
-	AuthID            string     `json:"auth_id,omitempty"`
-	AuthIndex         string     `json:"auth_index"`
-	AuthType          string     `json:"auth_type,omitempty"`
-	ExecutorType      string     `json:"executor_type,omitempty"`
-	ReasoningEffort   string     `json:"reasoning_effort"`
-	ServiceTier       string     `json:"service_tier"`
-	LatencyMs         int64      `json:"latency_ms"`
-	TTFTMs            int64      `json:"ttft_ms"`
-	Tokens            TokenStats `json:"tokens"`
-	Failed            bool       `json:"failed"`
-	FailureStatusCode int        `json:"failure_status_code,omitempty"`
-	FailureBody       string     `json:"failure_body,omitempty"`
+	ID                string      `json:"id"`
+	Timestamp         time.Time   `json:"timestamp"`
+	Provider          string      `json:"provider,omitempty"`
+	Model             string      `json:"model,omitempty"`
+	Alias             string      `json:"alias,omitempty"`
+	Source            string      `json:"source"`
+	AuthID            string      `json:"auth_id,omitempty"`
+	AuthIndex         string      `json:"auth_index"`
+	AuthType          string      `json:"auth_type,omitempty"`
+	ExecutorType      string      `json:"executor_type,omitempty"`
+	ReasoningEffort   string      `json:"reasoning_effort"`
+	ServiceTier       string      `json:"service_tier"`
+	LatencyMs         int64       `json:"latency_ms"`
+	TTFTMs            int64       `json:"ttft_ms"`
+	Tokens            TokenStats  `json:"tokens"`
+	Failed            bool        `json:"failed"`
+	FailureStatusCode int         `json:"failure_status_code,omitempty"`
+	FailureBody       failureBody `json:"failure_body,omitempty"`
 }
 
 // APIUsage groups details by grouping key (api_key or provider) then by model.
