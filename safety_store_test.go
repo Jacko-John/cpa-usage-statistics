@@ -173,6 +173,13 @@ VALUES (?, ?, ?, 0, 0)
 	if details := usage["client-key"]["gpt-5-codex"]; len(details) != 1 || details[0].ID != "linked" {
 		t.Fatalf("usage after cleanup = %+v", usage)
 	}
+	payload, err := store.usageSummaryJSON("all", time.Now().Unix())
+	if err != nil {
+		t.Fatalf("usage summary after cleanup: %v", err)
+	}
+	if summary := decodeUsageSummaryForTest(t, payload); summary.TotalRequests != 1 {
+		t.Fatalf("usage summary after cleanup = %+v", summary)
+	}
 	history, err := store.QuerySafetyHistory(ctx, SafetyHistoryQuery{APIKey: "client-key", Limit: 10})
 	if err != nil {
 		t.Fatalf("QuerySafetyHistory: %v", err)

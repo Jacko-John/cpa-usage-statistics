@@ -319,7 +319,7 @@ func TestParseConfig(t *testing.T) {
 
 func TestSQLiteSchemaHasNoChecksAndGoNormalizesValues(t *testing.T) {
 	store := newTestStore(t)
-	for _, table := range []string{"usage_records", "api_key_safety_state", "api_key_safety_history"} {
+	for _, table := range []string{"usage_records", "api_key_safety_state", "api_key_safety_history", "usage_pricing"} {
 		var schema string
 		if err := store.db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&schema); err != nil {
 			t.Fatalf("query schema for %s: %v", table, err)

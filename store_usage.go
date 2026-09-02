@@ -12,6 +12,10 @@ type sqlExecer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
+type sqlQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
 // Insert 写入一条用量记录。
 func (s *SQLiteStore) Insert(ctx context.Context, record Record) error {
 	if s == nil || s.db == nil {
@@ -22,10 +26,13 @@ func (s *SQLiteStore) Insert(ctx context.Context, record Record) error {
 	}
 
 	record = normalizeStoredRecord(record)
-	if err := insertUsageRecord(ctx, s.db, record); err != nil {
-		return fmt.Errorf("usage sqlite insert: %w", err)
-	}
-	return nil
+	return s.withConn(ctx, func(conn *sql.Conn) error {
+		if err := insertUsageRecord(ctx, conn, record); err != nil {
+			return fmt.Errorf("usage sqlite insert: %w", err)
+		}
+		s.statistics.add(record, time.Now().Unix())
+		return nil
+	})
 }
 
 func insertUsageRecord(ctx context.Context, exec sqlExecer, record Record) error {
@@ -116,6 +123,53 @@ FROM usage_records`
 	return result, nil
 }
 
+// QueryRecent 返回时间范围内最新的用量事件，limit 始终由调用方限制在 100 以内。
+func (s *SQLiteStore) QueryRecent(ctx context.Context, rng QueryRange, limit int) (APIUsage, error) {
+	if s == nil || s.db == nil {
+		return APIUsage{}, nil
+	}
+	limit = min(max(limit, 1), 100)
+	query := `
+SELECT id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
+       reasoning_effort, service_tier, latency_ms, ttft_ms,
+       input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
+       failed, failure_status_code, failure_body
+FROM usage_records`
+	args := make([]any, 0, 3)
+	separator := " WHERE "
+	if rng.Start != nil && !rng.Start.IsZero() {
+		query += separator + "timestamp >= ?"
+		args = append(args, ceilUnixSecond(*rng.Start))
+		separator = " AND "
+	}
+	if rng.End != nil && !rng.End.IsZero() {
+		query += separator + "timestamp < ?"
+		args = append(args, ceilUnixSecond(*rng.End))
+	}
+	query += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("usage sqlite query recent: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	result := APIUsage{}
+	for rows.Next() {
+		var detail RequestDetail
+		var apiKey string
+		if err := scanUsageDetail(rows, &apiKey, &detail); err != nil {
+			return nil, err
+		}
+		appendUsageDetail(result, groupingKey(apiKey, detail.Provider), normalizeModel(detail.Model), detail)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("usage sqlite recent rows: %w", err)
+	}
+	return result, nil
+}
+
 func scanUsageDetail(rows *sql.Rows, apiKey *string, detail *RequestDetail) error {
 	var timestamp int64
 	var failed int
@@ -175,23 +229,44 @@ func (s *SQLiteStore) Delete(ctx context.Context, ids *StableStringSet) (DeleteR
 	if len(values) == 0 {
 		return result, nil
 	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return result, fmt.Errorf("usage sqlite begin delete: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	const deleteBatchSize = 500
+	s.rebuildMu.Lock()
+	defer s.rebuildMu.Unlock()
+
+	now := time.Now().Unix()
+	pricing := s.statistics.pricing()
+	pricingKey := s.statistics.pricingKey()
+	removed := newUsageStatisticsState(now, pricing, pricingKey)
 	deletedIDs := make(map[string]struct{}, len(values))
-	for start := 0; start < len(values); start += deleteBatchSize {
-		end := min(start+deleteBatchSize, len(values))
-		if err := deleteUsageBatch(ctx, tx, values[start:end], deletedIDs); err != nil {
-			return result, err
+	if err := s.withConn(ctx, func(conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("usage sqlite begin delete: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return result, fmt.Errorf("usage sqlite commit delete: %w", err)
+		defer func() { _ = tx.Rollback() }()
+
+		for start := 0; start < len(values); start += deleteBatchSize {
+			end := min(start+deleteBatchSize, len(values))
+			if err := deleteUsageBatch(
+				ctx,
+				tx,
+				values[start:end],
+				deletedIDs,
+				&removed,
+				now,
+			); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("usage sqlite commit delete: %w", err)
+		}
+		if len(deletedIDs) > 0 {
+			s.statistics.remove(&removed, time.Now().Unix())
+		}
+		return nil
+	}); err != nil {
+		return result, err
 	}
 
 	result.Deleted = int64(len(deletedIDs))
@@ -206,7 +281,14 @@ func (s *SQLiteStore) Delete(ctx context.Context, ids *StableStringSet) (DeleteR
 	return result, nil
 }
 
-func deleteUsageBatch(ctx context.Context, tx *sql.Tx, ids []string, deleted map[string]struct{}) error {
+func deleteUsageBatch(
+	ctx context.Context,
+	tx *sql.Tx,
+	ids []string,
+	deleted map[string]struct{},
+	removed *usageStatisticsState,
+	now int64,
+) error {
 	placeholders := strings.Repeat("?,", len(ids))
 	query := `DELETE FROM usage_records
 WHERE id IN (` + placeholders[:len(placeholders)-1] + `)
@@ -215,7 +297,7 @@ WHERE id IN (` + placeholders[:len(placeholders)-1] + `)
       FROM api_key_safety_history AS history
       WHERE history.usage_record_id = usage_records.id
   )
-RETURNING id`
+RETURNING id, ` + statisticsRecordColumns
 	args := make([]any, len(ids))
 	for i, id := range ids {
 		args[i] = id
@@ -227,11 +309,32 @@ RETURNING id`
 	}
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err != nil {
+		var record usageStatisticsRecord
+		var failed int
+		if err := rows.Scan(
+			&id,
+			&record.Timestamp,
+			&record.APIKey,
+			&record.Provider,
+			&record.Model,
+			&record.Source,
+			&record.AuthType,
+			&record.ServiceTier,
+			&record.LatencyMs,
+			&record.TTFTMs,
+			&record.InputTokens,
+			&record.OutputTokens,
+			&record.CachedTokens,
+			&record.CacheCreationTokens,
+			&record.TotalTokens,
+			&failed,
+		); err != nil {
 			_ = rows.Close()
-			return fmt.Errorf("usage sqlite scan deleted id: %w", err)
+			return fmt.Errorf("usage sqlite scan deleted record: %w", err)
 		}
+		record.Failed = failed != 0
 		deleted[id] = struct{}{}
+		removed.addRecord(record, now)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -248,24 +351,113 @@ func (s *SQLiteStore) DeleteBefore(ctx context.Context, cutoff time.Time) (int64
 	if s == nil || s.db == nil {
 		return 0, nil
 	}
+	s.rebuildMu.Lock()
+	defer s.rebuildMu.Unlock()
 
-	result, err := s.db.ExecContext(ctx, `
-DELETE FROM usage_records
+	now := time.Now().Unix()
+	pricing := s.statistics.pricing()
+	pricingKey := s.statistics.pricingKey()
+	var deleted int64
+	var removed *usageStatisticsState
+	cutoffSecond := ceilUnixSecond(cutoff)
+	err := s.withConn(ctx, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+			return fmt.Errorf("usage sqlite begin delete before: %w", err)
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+			}
+		}()
+
+		where := `
 WHERE timestamp < ?
   AND NOT EXISTS (
       SELECT 1
       FROM api_key_safety_history AS history
       WHERE history.usage_record_id = usage_records.id
-  )
-`, ceilUnixSecond(cutoff))
+  )`
+		rows, err := conn.QueryContext(
+			ctx,
+			"SELECT "+statisticsRecordColumns+" FROM usage_records"+where,
+			cutoffSecond,
+		)
+		if err != nil {
+			return fmt.Errorf("usage sqlite select delete before: %w", err)
+		}
+		// 直接 Scan，避免大批清理时为每条记录额外分配对象。
+		for rows.Next() {
+			var record usageStatisticsRecord
+			var failed int
+			if err := rows.Scan(
+				&record.Timestamp,
+				&record.APIKey,
+				&record.Provider,
+				&record.Model,
+				&record.Source,
+				&record.AuthType,
+				&record.ServiceTier,
+				&record.LatencyMs,
+				&record.TTFTMs,
+				&record.InputTokens,
+				&record.OutputTokens,
+				&record.CachedTokens,
+				&record.CacheCreationTokens,
+				&record.TotalTokens,
+				&failed,
+			); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("usage sqlite scan deleted record: %w", err)
+			}
+			record.Failed = failed != 0
+			if removed == nil {
+				state := newUsageStatisticsState(now, pricing, pricingKey)
+				removed = &state
+			}
+			removed.addRecord(record, now)
+			deleted++
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("usage sqlite deleted records: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("usage sqlite close deleted records: %w", err)
+		}
+
+		result, err := conn.ExecContext(
+			ctx,
+			"DELETE FROM usage_records"+where,
+			cutoffSecond,
+		)
+		if err != nil {
+			return fmt.Errorf("usage sqlite delete before: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("usage sqlite rows affected: %w", err)
+		}
+		if affected != deleted {
+			return fmt.Errorf(
+				"usage sqlite delete before changed %d rows after selecting %d",
+				affected,
+				deleted,
+			)
+		}
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return fmt.Errorf("usage sqlite commit delete before: %w", err)
+		}
+		committed = true
+		if removed != nil {
+			s.statistics.remove(removed, time.Now().Unix())
+		}
+		return nil
+	})
 	if err != nil {
-		return 0, fmt.Errorf("usage sqlite delete before: %w", err)
+		return 0, err
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("usage sqlite rows affected: %w", err)
-	}
-	return rows, nil
+	return deleted, nil
 }
 
 // ceilUnixSecond 将精确时间边界映射到第一个不早于它的整数秒。

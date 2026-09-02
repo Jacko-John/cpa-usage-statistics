@@ -11,6 +11,9 @@ CLIProxyAPI 的持久化用量统计插件。插件将请求用量写入本地 S
 ## 功能
 
 - 持久化每次请求的用量、延迟、失败信息和 Token 统计。
+- 在内存中增量维护监控摘要、时间序列和凭证配额窗口统计。
+- 由插件持久化模型价格和 Service Tier 倍率，并逐请求精确计算成本。
+- 请求事件按需查询，服务端最多返回最新 100 条。
 - 按保留天数清理旧记录。
 - 识别上游 `cyber_policy` 安全错误。
 - 按下游 API Key 统计安全触发总数、精确滑动窗口次数和历史限流次数。
@@ -91,11 +94,15 @@ X-Goog-Api-Key: <APIKey>
 
 以下路由均受 CLIProxyAPI 管理鉴权保护。
 
-### 查询用量
+### 按需查询请求事件
 
 ```http
-GET /v0/management/plugins/usage-statistics/usage?start=<RFC3339>&end=<RFC3339>
+GET /v0/management/plugins/usage-statistics/usage?start=<RFC3339>&end=<RFC3339>&limit=<数量>
 ```
+
+- `start` 和 `end` 可选，采用左闭右开时间范围。
+- `limit` 可选，默认 100；无论传入多大值，服务端最多返回最新 100 条。
+- 此接口仅用于事件明细按需加载，不用于监控摘要。
 
 响应按“API Key 或 provider → 模型”两层聚合：
 
@@ -132,6 +139,117 @@ GET /v0/management/plugins/usage-statistics/usage?start=<RFC3339>&end=<RFC3339>
 ```
 
 `failure_body` 保留数据库中的完整原始正文，并在管理响应中按内容输出：合法 JSON 直接成为对应的 JSON 对象、数组或其他 JSON 值；非 JSON 正文作为普通 JSON 字符串；空正文继续省略该字段。不使用 Base64 编码或额外包装字段。
+
+### 读取和更新价格配置
+
+```http
+GET /v0/management/plugins/usage-statistics/pricing
+```
+
+```http
+PUT /v0/management/plugins/usage-statistics/pricing
+Content-Type: application/json
+```
+
+```json
+{
+  "prices": {
+    "gpt-5.4": {
+      "input": 2.5,
+      "output": 15,
+      "cacheCreate": 0,
+      "cacheRead": 0.25,
+      "contextTiers": []
+    }
+  },
+  "tier_multipliers": [
+    {"model": "gpt-5.4", "tier": "priority", "multiplier": 2}
+  ]
+}
+```
+
+价格配置由插件持久化，是统计成本的唯一数据源。`PUT` 会逐条重算历史成本；重建使用独立 WAL 只读快照，普通用量写入继续使用主连接。重建期间的新记录通过内存增量补齐，最终只短暂占用主连接来保存价格并切换统计状态。重建失败时继续使用旧价格和旧统计。
+
+Context tier 仅在请求的上下文 Token 严格大于 `threshold` 时生效；多个 tier 同时命中时选择最高阈值。Service Tier 倍率按模型名称和 `service_tier` 大小写不敏感精确匹配。
+
+### 查询预计算统计摘要
+
+```http
+POST /v0/management/plugins/usage-statistics/usage
+Content-Type: application/json
+```
+
+```json
+{
+  "range": "24h"
+}
+```
+
+`range` 支持 `7h`、`24h`、`7d`、`30d` 和 `all`。响应直接来自插件维护的内存快照，包含总请求数、成功/失败数、Token、成本、延迟、TPS、API Key、模型、凭证以及小时/天时间桶。小时桶使用 Unix 秒作为键；天桶按后端进程所在时区的自然日聚合，使用 `YYYY-MM-DD` 作为键。`all` 不统计 RPM/TPM，其 `rate_requests`、`rate_tokens` 和 `rate_minutes` 均为 `0`。
+
+```json
+{
+  "range": "24h",
+  "generated_at": 1788343200,
+  "rate_requests": 120,
+  "rate_tokens": 240000,
+  "rate_minutes": 1440,
+  "total_requests": 120,
+  "success_count": 118,
+  "failure_count": 2,
+  "total_tokens": 240000,
+  "total_cost": 1.23,
+  "apis": {},
+  "credentials": {},
+  "hours": {},
+  "days": {}
+}
+```
+
+插件启动时先读取持久化价格，再扫描 SQLite 一次建立统计状态；每次成功写入用量后按当前价格增量更新。摘要和凭证窗口请求只读取内存，不接收价格配置，也不查询 SQLite。只有 `PUT /pricing` 修改价格时才重建历史成本。
+
+### 查询凭证配额窗口统计
+
+```http
+POST /v0/management/plugins/usage-statistics/usage/credential-windows
+Content-Type: application/json
+```
+
+```json
+{
+  "windows": [
+    {
+      "id": "credential.json",
+      "auth_index": "auth-1",
+      "source": "credential.json",
+      "category": "claude_gpt",
+      "start": 1787738400,
+      "end": 1788343200
+    }
+  ]
+}
+```
+
+- `id` 是响应 Map 的键。
+- 凭证优先按 `auth_index` 匹配；为空时按 `source` 匹配。
+- `category` 支持 `all`、`claude_gpt`（Claude 和 GPT）以及 `gemini`。
+- `start`、`end` 使用 Unix 秒，窗口两端沿用 60 秒容差。
+- 插件通过最近 31 天的分钟桶和小时桶计算，不扫描原始事件表。
+- 窗口成本直接使用插件当前持久化价格，与监控摘要保持一致。
+
+```json
+{
+  "windows": {
+    "credential.json": {
+      "requests": 20,
+      "success_count": 19,
+      "failure_count": 1,
+      "tokens": 40000,
+      "cost": 0.42
+    }
+  }
+}
+```
 
 ### 删除用量记录
 

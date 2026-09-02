@@ -63,6 +63,10 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 			manual_released_at INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (api_key, occurred_at, usage_record_id)
 		) WITHOUT ROWID`,
+		`CREATE TABLE IF NOT EXISTS usage_pricing (
+			name TEXT PRIMARY KEY,
+			config BLOB NOT NULL
+		) WITHOUT ROWID`,
 		`CREATE INDEX IF NOT EXISTS idx_safety_history_usage_record_id ON api_key_safety_history(usage_record_id)`,
 	}
 	for _, statement := range statements {

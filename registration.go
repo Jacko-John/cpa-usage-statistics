@@ -47,8 +47,12 @@ var registrationConfigFields = [...]configFieldInfo{
 }
 
 var registeredManagementRoutes = [...]managementRoute{
-	{Method: "GET", Path: managementUsagePath, Description: "Query persisted usage grouped by api key and model."},
+	{Method: "GET", Path: managementUsagePath, Description: "Query at most 100 recent usage events."},
+	{Method: "POST", Path: managementUsagePath, Description: "Read precomputed usage statistics for a fixed range."},
 	{Method: "DELETE", Path: managementUsagePath, Description: "Delete persisted usage records by id."},
+	{Method: "POST", Path: managementUsageCredentialWindowsPath, Description: "Read precomputed credential usage for quota windows."},
+	{Method: "GET", Path: managementPricingPath, Description: "Read the persisted usage pricing configuration."},
+	{Method: "PUT", Path: managementPricingPath, Description: "Update usage pricing and rebuild precomputed costs."},
 	{Method: "GET", Path: managementSafetyKeysPath, Description: "List API-key safety counters and current limit state."},
 	{Method: "POST", Path: managementSafetyHistoryPath, Description: "Query safety trigger and limit history for one API key."},
 	{Method: "DELETE", Path: managementSafetyLimitsPath, Description: "Release current API-key safety limits."},

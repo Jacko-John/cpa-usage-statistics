@@ -1,0 +1,187 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"time"
+)
+
+const statisticsRecordColumns = `timestamp, api_key, provider, model, source, auth_type, service_tier,
+       latency_ms, ttft_ms, input_tokens, output_tokens, cached_tokens,
+       cache_creation_tokens, total_tokens, failed`
+
+func (s *usageStatistics) rebuild(ctx context.Context, queryer sqlQueryer, pricing usagePricing) error {
+	pricing, pricingKey := normalizeUsagePricing(pricing)
+	now := time.Now().Unix()
+	next := newUsageStatisticsState(now, pricing, pricingKey)
+	if err := scanStatisticsRecords(ctx, queryer, func(record usageStatisticsRecord) {
+		next.addRecord(record, now)
+	}); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.state = next
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *SQLiteStore) loadUsagePricing(ctx context.Context) (usagePricing, error) {
+	var encoded []byte
+	err := s.db.QueryRowContext(
+		ctx,
+		"SELECT config FROM usage_pricing WHERE name = ?",
+		usagePricingRowName,
+	).Scan(&encoded)
+	if err == sql.ErrNoRows {
+		pricing, _ := normalizeUsagePricing(usagePricing{})
+		return pricing, nil
+	}
+	if err != nil {
+		return usagePricing{}, fmt.Errorf("usage sqlite load pricing: %w", err)
+	}
+	var pricing usagePricing
+	if err := json.Unmarshal(encoded, &pricing); err != nil {
+		return usagePricing{}, fmt.Errorf("usage sqlite decode pricing: %w", err)
+	}
+	pricing, _ = normalizeUsagePricing(pricing)
+	return pricing, nil
+}
+
+func saveUsagePricing(ctx context.Context, exec sqlExecer, pricingKey string) error {
+	if _, err := exec.ExecContext(ctx, `
+INSERT INTO usage_pricing (name, config)
+VALUES (?, ?)
+ON CONFLICT(name) DO UPDATE SET config = excluded.config
+`, usagePricingRowName, []byte(pricingKey)); err != nil {
+		return fmt.Errorf("usage sqlite save pricing: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) usagePricing() usagePricing {
+	return s.statistics.pricing()
+}
+
+func (s *SQLiteStore) updateUsagePricing(ctx context.Context, pricing usagePricing) (usagePricing, error) {
+	pricing, pricingKey := normalizeUsagePricing(pricing)
+	if s.statistics.pricingKey() == pricingKey {
+		return pricing, nil
+	}
+
+	s.rebuildMu.Lock()
+	defer s.rebuildMu.Unlock()
+	if s.statistics.pricingKey() == pricingKey {
+		return pricing, nil
+	}
+
+	readerURL := &url.URL{Scheme: "file", Path: s.path, RawQuery: "mode=ro"}
+	reader, err := sql.Open("sqlite", readerURL.String())
+	if err != nil {
+		return usagePricing{}, fmt.Errorf("usage sqlite open statistics reader: %w", err)
+	}
+	reader.SetMaxOpenConns(1)
+	defer func() { _ = reader.Close() }()
+	if err := reader.PingContext(ctx); err != nil {
+		return usagePricing{}, fmt.Errorf("usage sqlite connect statistics reader: %w", err)
+	}
+
+	var snapshot *sql.Tx
+	if err := s.withConn(ctx, func(_ *sql.Conn) error {
+		var beginErr error
+		snapshot, beginErr = reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if beginErr != nil {
+			return fmt.Errorf("usage sqlite begin statistics snapshot: %w", beginErr)
+		}
+		var exists int
+		if err := snapshot.QueryRowContext(
+			ctx,
+			"SELECT EXISTS(SELECT 1 FROM usage_records)",
+		).Scan(&exists); err != nil {
+			return fmt.Errorf("usage sqlite establish statistics snapshot: %w", err)
+		}
+		s.statistics.beginPricingRebuild()
+		return nil
+	}); err != nil {
+		if snapshot != nil {
+			_ = snapshot.Rollback()
+		}
+		return usagePricing{}, err
+	}
+
+	pending := true
+	defer func() {
+		if pending {
+			s.statistics.cancelPricingRebuild()
+		}
+	}()
+
+	now := time.Now().Unix()
+	next := newUsageStatisticsState(now, pricing, pricingKey)
+	if err := scanStatisticsRecords(ctx, snapshot, func(record usageStatisticsRecord) {
+		next.addRecord(record, now)
+	}); err != nil {
+		_ = snapshot.Rollback()
+		return usagePricing{}, err
+	}
+	if err := snapshot.Commit(); err != nil {
+		return usagePricing{}, fmt.Errorf("usage sqlite finish statistics snapshot: %w", err)
+	}
+
+	if err := s.withConn(ctx, func(conn *sql.Conn) error {
+		if err := saveUsagePricing(ctx, conn, pricingKey); err != nil {
+			return err
+		}
+		s.statistics.finishPricingRebuild(next)
+		pending = false
+		return nil
+	}); err != nil {
+		return usagePricing{}, err
+	}
+	return pricing, nil
+}
+
+func scanStatisticsRecords(
+	ctx context.Context,
+	queryer sqlQueryer,
+	visit func(usageStatisticsRecord),
+) error {
+	rows, err := queryer.QueryContext(ctx, `SELECT `+statisticsRecordColumns+`
+FROM usage_records`)
+	if err != nil {
+		return fmt.Errorf("usage sqlite scan statistics: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	// Scan 保留在循环内，避免每条轻量记录整体逃逸到堆。
+	for rows.Next() {
+		var record usageStatisticsRecord
+		var failed int
+		if err := rows.Scan(
+			&record.Timestamp,
+			&record.APIKey,
+			&record.Provider,
+			&record.Model,
+			&record.Source,
+			&record.AuthType,
+			&record.ServiceTier,
+			&record.LatencyMs,
+			&record.TTFTMs,
+			&record.InputTokens,
+			&record.OutputTokens,
+			&record.CachedTokens,
+			&record.CacheCreationTokens,
+			&record.TotalTokens,
+			&failed,
+		); err != nil {
+			return fmt.Errorf("usage sqlite scan statistics row: %w", err)
+		}
+		record.Failed = failed != 0
+		visit(record)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("usage sqlite statistics rows: %w", err)
+	}
+	return nil
+}

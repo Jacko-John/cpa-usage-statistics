@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // InsertSafety 原子写入用量、安全历史和新的 Key 状态。
@@ -17,23 +18,24 @@ func (s *SQLiteStore) InsertSafety(ctx context.Context, record Record, state Saf
 	}
 
 	record = normalizeStoredRecord(record)
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("usage sqlite begin safety insert: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	return s.withConn(ctx, func(conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("usage sqlite begin safety insert: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
 
-	if err := insertUsageRecord(ctx, tx, record); err != nil {
-		return fmt.Errorf("usage sqlite insert: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
+		if err := insertUsageRecord(ctx, tx, record); err != nil {
+			return fmt.Errorf("usage sqlite insert: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
 INSERT INTO api_key_safety_history (
 	api_key, occurred_at, usage_record_id, blocked_until, manual_released_at
 ) VALUES (?, ?, ?, ?, ?)
 `, history.APIKey, history.OccurredAt, history.UsageRecordID, history.BlockedUntil, history.ManualReleasedAt); err != nil {
-		return fmt.Errorf("usage sqlite insert safety history: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
+			return fmt.Errorf("usage sqlite insert safety history: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
 INSERT INTO api_key_safety_state (
 	api_key,
 	total_trigger_count,
@@ -53,21 +55,23 @@ ON CONFLICT(api_key) DO UPDATE SET
 	active_limit_usage_record_id = excluded.active_limit_usage_record_id,
 	manual_disabled             = excluded.manual_disabled
 `,
-		state.APIKey,
-		state.TotalTriggerCount,
-		state.TotalLimitCount,
-		encodeTriggerTimes(state.RecentTriggerTimes),
-		state.BlockedUntil,
-		state.ActiveLimitStartedAt,
-		state.ActiveLimitUsageRecordID,
-		state.ManualDisabled,
-	); err != nil {
-		return fmt.Errorf("usage sqlite upsert safety state: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("usage sqlite commit safety insert: %w", err)
-	}
-	return nil
+			state.APIKey,
+			state.TotalTriggerCount,
+			state.TotalLimitCount,
+			encodeTriggerTimes(state.RecentTriggerTimes),
+			state.BlockedUntil,
+			state.ActiveLimitStartedAt,
+			state.ActiveLimitUsageRecordID,
+			state.ManualDisabled,
+		); err != nil {
+			return fmt.Errorf("usage sqlite upsert safety state: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("usage sqlite commit safety insert: %w", err)
+		}
+		s.statistics.add(record, time.Now().Unix())
+		return nil
+	})
 }
 
 // LoadSafetyStates 加载全部 API Key 安全状态。

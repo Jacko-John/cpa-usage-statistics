@@ -42,8 +42,21 @@ func handleManagement(request []byte) ([]byte, error) {
 		switch method {
 		case "GET":
 			return usageGet(req)
+		case "POST":
+			return usagePost(req)
 		case "DELETE":
 			return usageDelete(req)
+		}
+	case managementUsageCredentialWindowsPath:
+		if method == "POST" {
+			return usageCredentialWindowsPost(req)
+		}
+	case managementPricingPath:
+		switch method {
+		case "GET":
+			return usagePricingGet()
+		case "PUT":
+			return usagePricingPut(req)
 		}
 	case managementSafetyKeysPath:
 		if method == "GET" {
@@ -72,6 +85,14 @@ func handleManagement(request []byte) ([]byte, error) {
 
 func managementErrorResponse(status int, message string) managementResponse {
 	return jsonManagementResponse(status, managementErrorPayload{Error: message})
+}
+
+func rawJSONManagementResponse(status int, body []byte) managementResponse {
+	return managementResponse{
+		StatusCode: status,
+		Headers:    jsonResponseHeaders,
+		Body:       body,
+	}
 }
 
 func jsonManagementResponse(status int, payload any) managementResponse {
