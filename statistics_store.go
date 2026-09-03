@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -77,7 +79,12 @@ func (s *SQLiteStore) updateUsagePricing(ctx context.Context, pricing usagePrici
 		return pricing, nil
 	}
 
-	readerURL := &url.URL{Scheme: "file", Path: s.path, RawQuery: "mode=ro"}
+	readerPath := filepath.ToSlash(s.path)
+	// file URL 中的 Windows 盘符路径必须以斜杠开头。
+	if filepath.VolumeName(s.path) != "" && !strings.HasPrefix(readerPath, "/") {
+		readerPath = "/" + readerPath
+	}
+	readerURL := &url.URL{Scheme: "file", Path: readerPath, RawQuery: "mode=ro"}
 	reader, err := sql.Open("sqlite", readerURL.String())
 	if err != nil {
 		return usagePricing{}, fmt.Errorf("usage sqlite open statistics reader: %w", err)

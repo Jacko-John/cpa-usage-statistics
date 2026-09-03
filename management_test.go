@@ -111,6 +111,7 @@ cooldown: "1800"
 }
 
 func TestRegistrationNegotiatesSchemaAndInterceptorCapability(t *testing.T) {
+	tempDir := t.TempDir()
 	previousSafety := safety
 	previousSchema := negotiatedSchemaVersion.Load()
 	previousRetention := retentionDays.Load()
@@ -122,7 +123,7 @@ func TestRegistrationNegotiatesSchemaAndInterceptorCapability(t *testing.T) {
 		retentionDays.Store(previousRetention)
 	})
 
-	configureForSchemaTest(t, 4, filepath.Join(t.TempDir(), "v4"))
+	configureForSchemaTest(t, 4, filepath.Join(tempDir, "v4"))
 	registration := registerResponse()
 	if registration.SchemaVersion != 2 || !registration.Capabilities.RequestInterceptor {
 		t.Fatalf("schema 4 registration = %+v", registration)
@@ -140,7 +141,7 @@ func TestRegistrationNegotiatesSchemaAndInterceptorCapability(t *testing.T) {
 	}
 
 	closeStore()
-	configureForSchemaTest(t, 1, filepath.Join(t.TempDir(), "v1"))
+	configureForSchemaTest(t, 1, filepath.Join(tempDir, "v1"))
 	registration = registerResponse()
 	if registration.SchemaVersion != 1 || registration.Capabilities.RequestInterceptor {
 		t.Fatalf("schema 1 registration = %+v", registration)
