@@ -23,7 +23,7 @@ const (
 var (
 	pluginVersion    = "0.2.0"
 	pluginAuthor     = "Fwindy"
-	pluginRepository = "https://github.com/Fwindy/cpa-usage-statistics"
+	pluginRepository = "https://github.com/Jacko-John/cpa-usage-statistics"
 )
 
 func main() {}

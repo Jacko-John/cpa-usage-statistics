@@ -6,7 +6,7 @@ CLIProxyAPI 的持久化用量统计插件。插件将请求用量写入本地 S
 
 ## 建议使用配套的前端面板
 
-[配套面板](https://github.com/Fwindy/Cli-Proxy-API-Management-Center)
+[配套面板](https://github.com/Jacko-John/Cli-Proxy-API-Management-Center)
 
 ## 功能
 

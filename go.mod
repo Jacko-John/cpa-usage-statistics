@@ -1,4 +1,4 @@
-module github.com/Fwindy/cpa-usage-statistics
+module github.com/Jacko-John/cpa-usage-statistics
 
 go 1.25.0
 
