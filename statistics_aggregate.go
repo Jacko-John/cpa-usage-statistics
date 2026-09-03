@@ -7,18 +7,18 @@ import (
 )
 
 type usageAggregate struct {
-	TotalRequests                       int64   `json:"total_requests"`
-	SuccessCount                        int64   `json:"success_count"`
-	FailureCount                        int64   `json:"failure_count"`
-	TotalTokens                         int64   `json:"total_tokens"`
-	TotalCost                           float64 `json:"total_cost"`
-	LatencyTotalMs                      int64   `json:"latency_total_ms"`
-	LatencySampleCount                  int64   `json:"latency_sample_count"`
-	FirstByteLatencyTotalMs             int64   `json:"first_byte_latency_total_ms"`
-	FirstByteLatencySampleCount         int64   `json:"first_byte_latency_sample_count"`
-	PositiveFirstByteLatencySampleCount int64   `json:"positive_first_byte_latency_sample_count"`
-	TPSTotal                            float64 `json:"tps_total"`
-	TPSSampleCount                      int64   `json:"tps_sample_count"`
+	TotalRequests               int64   `json:"total_requests"`
+	SuccessCount                int64   `json:"success_count"`
+	FailureCount                int64   `json:"failure_count"`
+	TotalTokens                 int64   `json:"total_tokens"`
+	TotalCost                   float64 `json:"total_cost"`
+	LatencyTotalMs              int64   `json:"latency_total_ms"`
+	LatencySampleCount          int64   `json:"latency_sample_count"`
+	FirstByteLatencyTotalMs     int64   `json:"first_byte_latency_total_ms"`
+	FirstByteLatencySampleCount int64   `json:"first_byte_latency_sample_count"`
+	TPSOutputTokens             int64   `json:"tps_output_tokens"`
+	TPSGenerationDurationMs     int64   `json:"tps_generation_duration_ms"`
+	TPSSampleCount              int64   `json:"tps_sample_count"`
 }
 
 type usageAPIAggregate struct {
@@ -336,14 +336,14 @@ func (metric *usageAggregate) addRecord(record usageStatisticsRecord, cost float
 	metric.TotalCost += cost
 	metric.LatencyTotalMs += record.LatencyMs
 	metric.LatencySampleCount++
-	metric.FirstByteLatencyTotalMs += record.TTFTMs
-	metric.FirstByteLatencySampleCount++
 	if record.TTFTMs > 0 {
-		metric.PositiveFirstByteLatencySampleCount++
+		metric.FirstByteLatencyTotalMs += record.TTFTMs
+		metric.FirstByteLatencySampleCount++
 	}
 	generationMs := record.LatencyMs - record.TTFTMs
-	if generationMs > 0 {
-		metric.TPSTotal += float64(record.OutputTokens) / (float64(generationMs) / 1000)
+	if !record.Failed && record.OutputTokens > 0 && generationMs > 0 {
+		metric.TPSOutputTokens += record.OutputTokens
+		metric.TPSGenerationDurationMs += generationMs
 		metric.TPSSampleCount++
 	}
 }
@@ -358,10 +358,10 @@ func (metric *usageAggregate) subtract(other *usageAggregate) {
 	metric.LatencySampleCount -= other.LatencySampleCount
 	metric.FirstByteLatencyTotalMs -= other.FirstByteLatencyTotalMs
 	metric.FirstByteLatencySampleCount -= other.FirstByteLatencySampleCount
-	metric.PositiveFirstByteLatencySampleCount -= other.PositiveFirstByteLatencySampleCount
-	metric.TPSTotal -= other.TPSTotal
+	metric.TPSOutputTokens -= other.TPSOutputTokens
+	metric.TPSGenerationDurationMs -= other.TPSGenerationDurationMs
 	metric.TPSSampleCount -= other.TPSSampleCount
-	metric.normalizeFloatResiduals()
+	metric.normalizeCostResidual()
 }
 
 func (metric *usageAggregate) subtractBucket(other *usageBucketAggregate) {
@@ -373,19 +373,16 @@ func (metric *usageAggregate) subtractBucket(other *usageBucketAggregate) {
 	metric.LatencyTotalMs -= other.LatencyTotalMs
 	metric.LatencySampleCount -= other.TotalRequests
 	metric.FirstByteLatencyTotalMs -= other.FirstByteLatencyTotalMs
-	metric.FirstByteLatencySampleCount -= other.TotalRequests
-	metric.PositiveFirstByteLatencySampleCount -= other.PositiveFirstByteLatencySampleCount
-	metric.TPSTotal -= other.TPSTotal
+	metric.FirstByteLatencySampleCount -= other.FirstByteLatencySampleCount
+	metric.TPSOutputTokens -= other.TPSOutputTokens
+	metric.TPSGenerationDurationMs -= other.TPSGenerationDurationMs
 	metric.TPSSampleCount -= other.TPSSampleCount
-	metric.normalizeFloatResiduals()
+	metric.normalizeCostResidual()
 }
 
-func (metric *usageAggregate) normalizeFloatResiduals() {
+func (metric *usageAggregate) normalizeCostResidual() {
 	if metric.TotalCost < 0 && metric.TotalCost > -1e-9 {
 		metric.TotalCost = 0
-	}
-	if metric.TPSTotal < 0 && metric.TPSTotal > -1e-9 {
-		metric.TPSTotal = 0
 	}
 }
 
@@ -399,8 +396,8 @@ func (metric *usageAggregate) add(other *usageAggregate) {
 	metric.LatencySampleCount += other.LatencySampleCount
 	metric.FirstByteLatencyTotalMs += other.FirstByteLatencyTotalMs
 	metric.FirstByteLatencySampleCount += other.FirstByteLatencySampleCount
-	metric.PositiveFirstByteLatencySampleCount += other.PositiveFirstByteLatencySampleCount
-	metric.TPSTotal += other.TPSTotal
+	metric.TPSOutputTokens += other.TPSOutputTokens
+	metric.TPSGenerationDurationMs += other.TPSGenerationDurationMs
 	metric.TPSSampleCount += other.TPSSampleCount
 }
 

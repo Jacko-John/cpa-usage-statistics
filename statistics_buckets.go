@@ -13,15 +13,16 @@ type usageDimensionTable struct {
 
 // usageBucketAggregate 只保存分钟桶未来执行扣减时不可推导的字段。
 type usageBucketAggregate struct {
-	TotalRequests                       int64
-	FailureCount                        int64
-	TotalTokens                         int64
-	TotalCost                           float64
-	LatencyTotalMs                      int64
-	FirstByteLatencyTotalMs             int64
-	PositiveFirstByteLatencySampleCount int64
-	TPSTotal                            float64
-	TPSSampleCount                      int64
+	TotalRequests               int64
+	FailureCount                int64
+	TotalTokens                 int64
+	TotalCost                   float64
+	LatencyTotalMs              int64
+	FirstByteLatencyTotalMs     int64
+	FirstByteLatencySampleCount int64
+	TPSOutputTokens             int64
+	TPSGenerationDurationMs     int64
+	TPSSampleCount              int64
 }
 
 type usageBucketDimensionKind uint8
@@ -448,15 +449,16 @@ func (bucket *credentialTimeBucket) empty() bool {
 
 func newUsageBucketAggregate(contribution *usageAggregate) usageBucketAggregate {
 	return usageBucketAggregate{
-		TotalRequests:                       contribution.TotalRequests,
-		FailureCount:                        contribution.FailureCount,
-		TotalTokens:                         contribution.TotalTokens,
-		TotalCost:                           contribution.TotalCost,
-		LatencyTotalMs:                      contribution.LatencyTotalMs,
-		FirstByteLatencyTotalMs:             contribution.FirstByteLatencyTotalMs,
-		PositiveFirstByteLatencySampleCount: contribution.PositiveFirstByteLatencySampleCount,
-		TPSTotal:                            contribution.TPSTotal,
-		TPSSampleCount:                      contribution.TPSSampleCount,
+		TotalRequests:               contribution.TotalRequests,
+		FailureCount:                contribution.FailureCount,
+		TotalTokens:                 contribution.TotalTokens,
+		TotalCost:                   contribution.TotalCost,
+		LatencyTotalMs:              contribution.LatencyTotalMs,
+		FirstByteLatencyTotalMs:     contribution.FirstByteLatencyTotalMs,
+		FirstByteLatencySampleCount: contribution.FirstByteLatencySampleCount,
+		TPSOutputTokens:             contribution.TPSOutputTokens,
+		TPSGenerationDurationMs:     contribution.TPSGenerationDurationMs,
+		TPSSampleCount:              contribution.TPSSampleCount,
 	}
 }
 
@@ -467,8 +469,9 @@ func (metric *usageBucketAggregate) add(contribution *usageAggregate) {
 	metric.TotalCost += contribution.TotalCost
 	metric.LatencyTotalMs += contribution.LatencyTotalMs
 	metric.FirstByteLatencyTotalMs += contribution.FirstByteLatencyTotalMs
-	metric.PositiveFirstByteLatencySampleCount += contribution.PositiveFirstByteLatencySampleCount
-	metric.TPSTotal += contribution.TPSTotal
+	metric.FirstByteLatencySampleCount += contribution.FirstByteLatencySampleCount
+	metric.TPSOutputTokens += contribution.TPSOutputTokens
+	metric.TPSGenerationDurationMs += contribution.TPSGenerationDurationMs
 	metric.TPSSampleCount += contribution.TPSSampleCount
 }
 
@@ -479,14 +482,12 @@ func (metric *usageBucketAggregate) subtract(other *usageBucketAggregate) {
 	metric.TotalCost -= other.TotalCost
 	metric.LatencyTotalMs -= other.LatencyTotalMs
 	metric.FirstByteLatencyTotalMs -= other.FirstByteLatencyTotalMs
-	metric.PositiveFirstByteLatencySampleCount -= other.PositiveFirstByteLatencySampleCount
-	metric.TPSTotal -= other.TPSTotal
+	metric.FirstByteLatencySampleCount -= other.FirstByteLatencySampleCount
+	metric.TPSOutputTokens -= other.TPSOutputTokens
+	metric.TPSGenerationDurationMs -= other.TPSGenerationDurationMs
 	metric.TPSSampleCount -= other.TPSSampleCount
 	if metric.TotalCost < 0 && metric.TotalCost > -1e-9 {
 		metric.TotalCost = 0
-	}
-	if metric.TPSTotal < 0 && metric.TPSTotal > -1e-9 {
-		metric.TPSTotal = 0
 	}
 }
 

@@ -182,6 +182,72 @@ func TestUsageStatisticsIncrementalRanges(t *testing.T) {
 	}
 }
 
+func TestUsageAggregateTracksValidTimingSamples(t *testing.T) {
+	var metric usageAggregate
+	for _, record := range []usageStatisticsRecord{
+		{LatencyMs: 1000, TTFTMs: 200, OutputTokens: 10},
+		{LatencyMs: 2200, TTFTMs: 200, OutputTokens: 100},
+		{LatencyMs: 2, OutputTokens: 1000, Failed: true},
+		{LatencyMs: 1000, TTFTMs: 100},
+	} {
+		metric.addRecord(record, 0)
+	}
+
+	if metric.FirstByteLatencyTotalMs != 500 || metric.FirstByteLatencySampleCount != 3 {
+		t.Fatalf("first-byte aggregate = %+v", metric)
+	}
+	if metric.TPSOutputTokens != 110 || metric.TPSGenerationDurationMs != 2800 || metric.TPSSampleCount != 2 {
+		t.Fatalf("TPS aggregate = %+v", metric)
+	}
+}
+
+func TestUsageStatisticsTimingRangeSubtractsExpiredBuckets(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC).Unix()
+	statistics := newStatisticsForTest(now, usagePricing{})
+	for _, record := range []Record{
+		{
+			ID:        "expired",
+			Timestamp: time.Unix(now-6*statisticsHour, 0),
+			APIKey:    "client-key",
+			Model:     "model-a",
+			LatencyMs: 1000,
+			TTFTMs:    200,
+			Tokens:    TokenStats{OutputTokens: 10},
+		},
+		{
+			ID:        "retained",
+			Timestamp: time.Unix(now-4*statisticsHour, 0),
+			APIKey:    "client-key",
+			Model:     "model-a",
+			LatencyMs: 2200,
+			TTFTMs:    200,
+			Tokens:    TokenStats{OutputTokens: 100},
+		},
+	} {
+		statistics.add(record, now)
+	}
+
+	payload, err := statistics.summaryJSON("7h", now)
+	if err != nil {
+		t.Fatalf("initial summary: %v", err)
+	}
+	api := decodeUsageSummaryForTest(t, payload).APIs["client-key"]
+	if api == nil || api.TPSOutputTokens != 110 || api.TPSGenerationDurationMs != 2800 ||
+		api.FirstByteLatencyTotalMs != 400 || api.FirstByteLatencySampleCount != 2 {
+		t.Fatalf("initial timing aggregate = %+v", api)
+	}
+
+	payload, err = statistics.summaryJSON("7h", now+2*statisticsHour)
+	if err != nil {
+		t.Fatalf("advanced summary: %v", err)
+	}
+	api = decodeUsageSummaryForTest(t, payload).APIs["client-key"]
+	if api == nil || api.TPSOutputTokens != 100 || api.TPSGenerationDurationMs != 2000 ||
+		api.FirstByteLatencyTotalMs != 200 || api.FirstByteLatencySampleCount != 1 {
+		t.Fatalf("advanced timing aggregate = %+v", api)
+	}
+}
+
 func TestUsageStatisticsGroupsDaysByServerTimeZone(t *testing.T) {
 	previousLocation := time.Local
 	time.Local = time.FixedZone("UTC+8", 8*60*60)
