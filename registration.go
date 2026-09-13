@@ -47,6 +47,15 @@ var registrationConfigFields = [...]configFieldInfo{
 }
 
 var registeredManagementRoutes = [...]managementRoute{
+	{Method: "GET", Path: managementNotificationSettingsPath, Description: "读取用量通知设置。"},
+	{Method: "PUT", Path: managementNotificationSettingsPath, Description: "配置通知时间与 QQ SMTP。"},
+	{Method: "GET", Path: managementNotificationSubscriptionsPath, Description: "列出 Key 邮箱订阅。"},
+	{Method: "POST", Path: managementNotificationSubscriptionsPath, Description: "新增通知订阅。"},
+	{Method: "PATCH", Path: managementNotificationSubscriptionsPath, Description: "修改通知订阅。"},
+	{Method: "DELETE", Path: managementNotificationSubscriptionsPath, Description: "删除订阅并保留周期历史。"},
+	{Method: "POST", Path: managementNotificationHistoryPath, Description: "读取当前与最近十期通知用量。"},
+	{Method: "POST", Path: managementNotificationTestEmailPath, Description: "发送测试邮件。"},
+	{Method: "POST", Path: managementNotificationRetryPath, Description: "重试指定周期邮件。"},
 	{Method: "GET", Path: managementUsagePath, Description: "Query at most 100 recent usage events."},
 	{Method: "POST", Path: managementUsagePath, Description: "Read precomputed usage statistics for a fixed range."},
 	{Method: "DELETE", Path: managementUsagePath, Description: "Delete persisted usage records by id."},

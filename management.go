@@ -38,6 +38,36 @@ func handleManagement(request []byte) ([]byte, error) {
 	path := strings.TrimPrefix(strings.TrimSpace(req.Path), "/v0/management")
 
 	switch path {
+	case managementNotificationSettingsPath:
+		switch method {
+		case "GET":
+			return notificationSettingsGet()
+		case "PUT":
+			return notificationSettingsPut(req)
+		}
+	case managementNotificationSubscriptionsPath:
+		switch method {
+		case "GET":
+			return notificationSubscriptionsGet()
+		case "POST":
+			return notificationSubscriptionsPost(req)
+		case "PATCH":
+			return notificationSubscriptionsPatch(req)
+		case "DELETE":
+			return notificationSubscriptionsDelete(req)
+		}
+	case managementNotificationHistoryPath:
+		if method == "POST" {
+			return notificationHistoryPost(req)
+		}
+	case managementNotificationTestEmailPath:
+		if method == "POST" {
+			return notificationTestEmailPost(req)
+		}
+	case managementNotificationRetryPath:
+		if method == "POST" {
+			return notificationRetryPost(req)
+		}
 	case managementUsagePath:
 		switch method {
 		case "GET":

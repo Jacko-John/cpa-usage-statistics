@@ -9,19 +9,25 @@ const (
 	pluginName                 = "Usage Statistics"
 
 	// 管理路由由宿主统一挂载到 /v0/management。
-	managementUsagePath                  = "/plugins/" + pluginID + "/usage"
-	managementUsageCredentialWindowsPath = managementUsagePath + "/credential-windows"
-	managementPricingPath                = "/plugins/" + pluginID + "/pricing"
-	managementSafetyKeysPath             = "/plugins/" + pluginID + "/safety/keys"
-	managementSafetyHistoryPath          = "/plugins/" + pluginID + "/safety/history"
-	managementSafetyLimitsPath           = "/plugins/" + pluginID + "/safety/limits"
-	managementSafetyDisabledPath         = "/plugins/" + pluginID + "/safety/disabled"
-	insertTimeout                        = 5 * time.Second
+	managementUsagePath                     = "/plugins/" + pluginID + "/usage"
+	managementUsageCredentialWindowsPath    = managementUsagePath + "/credential-windows"
+	managementPricingPath                   = "/plugins/" + pluginID + "/pricing"
+	managementSafetyKeysPath                = "/plugins/" + pluginID + "/safety/keys"
+	managementSafetyHistoryPath             = "/plugins/" + pluginID + "/safety/history"
+	managementSafetyLimitsPath              = "/plugins/" + pluginID + "/safety/limits"
+	managementSafetyDisabledPath            = "/plugins/" + pluginID + "/safety/disabled"
+	managementNotificationsPath             = "/plugins/" + pluginID + "/notifications"
+	managementNotificationSettingsPath      = managementNotificationsPath + "/settings"
+	managementNotificationSubscriptionsPath = managementNotificationsPath + "/subscriptions"
+	managementNotificationHistoryPath       = managementNotificationsPath + "/history"
+	managementNotificationTestEmailPath     = managementNotificationsPath + "/test-email"
+	managementNotificationRetryPath         = managementNotificationsPath + "/retry"
+	insertTimeout                           = 5 * time.Second
 )
 
 // 可通过 -ldflags "-X main.pluginVersion=..." 覆盖。
 var (
-	pluginVersion    = "0.2.1"
+	pluginVersion    = "0.3.0"
 	pluginAuthor     = "Fwindy"
 	pluginRepository = "https://github.com/Jacko-John/cpa-usage-statistics"
 )

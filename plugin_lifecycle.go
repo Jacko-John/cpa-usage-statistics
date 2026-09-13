@@ -117,6 +117,7 @@ func configurePlugin(request []byte) error {
 		return err
 	}
 	retentionDays.Store(int64(cfg.RetentionDays))
+	currentStore().startNotifications()
 	negotiatedSchemaVersion.Store(schemaVersion)
 	if cfg.RetentionDays > 0 {
 		cleanupMu.Lock()

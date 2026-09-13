@@ -533,6 +533,57 @@ func (metric credentialWindowMetric) empty() bool {
 	return metric.Requests <= 0
 }
 
+// apiWindows 一次遍历相关分钟桶；超出缓存的窗口整段交给持久化查询。
+func (state *usageStatisticsState) apiWindows(queries []usageAPIWindowQuery, now int64) ([]usageAPIWindowSummary, []int) {
+	results := make([]usageAPIWindowSummary, len(queries))
+	var missing []int
+	byAPI := make(map[usageDimensionID][]int)
+	limit := floorUnix(now, statisticsMinute) + statisticsMinute
+	start, end := limit, int64(0)
+	for i, query := range queries {
+		until := min(query.End, limit)
+		if query.Start >= until {
+			continue
+		}
+		if query.Start < state.OldestMinute {
+			missing = append(missing, i)
+			continue
+		}
+		id, ok := state.Dimensions.lookup(strings.TrimSpace(query.APIKey))
+		if !ok {
+			continue
+		}
+		byAPI[id] = append(byAPI[id], i)
+		start = min(start, query.Start)
+		end = max(end, until)
+	}
+	for minute := start; minute < end; minute += statisticsMinute {
+		bucket := state.MinuteBuckets[minute]
+		if bucket == nil {
+			continue
+		}
+		for _, dimension := range bucket.Dimensions {
+			if dimension.Kind != usageBucketModel {
+				continue
+			}
+			for _, i := range byAPI[dimension.Primary] {
+				query := queries[i]
+				if minute < query.Start || minute >= query.End {
+					continue
+				}
+				metric := &results[i]
+				metric.Requests += dimension.Metric.TotalRequests
+				metric.Tokens += dimension.Metric.TotalTokens
+				metric.Cost += dimension.Metric.TotalCost
+				if _, priced := state.Pricing.Prices[state.Dimensions.value(dimension.Secondary)]; !priced {
+					metric.Unpriced += dimension.Metric.TotalRequests
+				}
+			}
+		}
+	}
+	return results, missing
+}
+
 func (state *usageStatisticsState) credentialWindow(query credentialWindowQuery) credentialWindowSummary {
 	start := query.Start - statisticsMinute
 	end := query.End + statisticsMinute

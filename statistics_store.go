@@ -138,6 +138,10 @@ func (s *SQLiteStore) updateUsagePricing(ctx context.Context, pricing usagePrici
 	}
 
 	if err := s.withConn(ctx, func(conn *sql.Conn) error {
+		// 到期周期先按旧价格封存；尚未结束的周期随后读取重建后的共享统计。
+		if err := s.settleNotifications(ctx, conn, time.Now().Unix()); err != nil {
+			return err
+		}
 		if err := saveUsagePricing(ctx, conn, pricingKey); err != nil {
 			return err
 		}
@@ -150,6 +154,52 @@ func (s *SQLiteStore) updateUsagePricing(ctx context.Context, pricing usagePrici
 	return pricing, nil
 }
 
+// usageAPIWindows 的调用方持有唯一连接，保证缓存、补查明细与价格版本一致。
+func (s *SQLiteStore) usageAPIWindows(ctx context.Context, queryer sqlQueryer, queries []usageAPIWindowQuery, now int64) ([]usageAPIWindowSummary, error) {
+	results, missing, pricing := s.statistics.apiWindows(queries, now)
+	if len(missing) == 0 {
+		return results, nil
+	}
+	limit := floorUnix(now, statisticsMinute) + statisticsMinute
+	start, end := limit, int64(0)
+	byAPI := make(map[string][]int)
+	for _, i := range missing {
+		query := queries[i]
+		start = min(start, query.Start)
+		end = max(end, min(query.End, limit))
+		key := strings.TrimSpace(query.APIKey)
+		byAPI[key] = append(byAPI[key], i)
+	}
+	rows, err := queryer.QueryContext(ctx, `SELECT `+statisticsRecordColumns+`
+FROM usage_records WHERE timestamp >= ? AND timestamp < ?`, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("usage sqlite query historical windows: %w", err)
+	}
+	multipliers := buildTierMultiplierIndex(pricing.TierMultipliers)
+	err = scanStatisticsRows(rows, func(record usageStatisticsRecord) {
+		indices := byAPI[groupingKey(record.APIKey, record.Provider)]
+		if len(indices) == 0 {
+			return
+		}
+		cost := calculateStatisticsRecordCost(record, pricing.Prices, multipliers)
+		_, priced := pricing.Prices[record.Model]
+		for _, i := range indices {
+			query := queries[i]
+			if record.Timestamp < query.Start || record.Timestamp >= query.End {
+				continue
+			}
+			metric := &results[i]
+			metric.Requests++
+			metric.Tokens += record.TotalTokens
+			metric.Cost += cost
+			if !priced {
+				metric.Unpriced++
+			}
+		}
+	})
+	return results, err
+}
+
 func scanStatisticsRecords(
 	ctx context.Context,
 	queryer sqlQueryer,
@@ -160,6 +210,10 @@ FROM usage_records`)
 	if err != nil {
 		return fmt.Errorf("usage sqlite scan statistics: %w", err)
 	}
+	return scanStatisticsRows(rows, visit)
+}
+
+func scanStatisticsRows(rows *sql.Rows, visit func(usageStatisticsRecord)) error {
 	defer func() { _ = rows.Close() }()
 	// Scan 保留在循环内，避免每条轻量记录整体逃逸到堆。
 	for rows.Next() {

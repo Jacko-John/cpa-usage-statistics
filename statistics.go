@@ -101,6 +101,27 @@ type credentialWindowResponse struct {
 	Windows map[string]credentialWindowSummary `json:"windows"`
 }
 
+// usageAPIWindowQuery 使用分钟对齐的请求时间区间 [Start, End)。
+type usageAPIWindowQuery struct {
+	APIKey string
+	Start  int64
+	End    int64
+}
+
+type usageAPIWindowSummary struct {
+	Requests int64
+	Tokens   int64
+	Cost     float64
+	Unpriced int64
+}
+
+func (s *usageStatistics) apiWindows(queries []usageAPIWindowQuery, now int64) ([]usageAPIWindowSummary, []int, usagePricing) {
+	s.lockCurrentForRead(now)
+	defer s.mu.RUnlock()
+	results, missing := s.state.apiWindows(queries, now)
+	return results, missing, s.state.Pricing
+}
+
 func newUsageStatisticsState(now int64, pricing usagePricing, pricingKey string) usageStatisticsState {
 	var ranges [statisticsRangeCount]usageRangeState
 	for index, seconds := range statisticsRanges {

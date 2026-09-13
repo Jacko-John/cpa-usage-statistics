@@ -14,10 +14,11 @@ import (
 
 // SQLiteStore 持久化用量记录和 API Key 安全状态。
 type SQLiteStore struct {
-	db         *sql.DB
-	path       string
-	statistics *usageStatistics
-	rebuildMu  sync.Mutex
+	db            *sql.DB
+	path          string
+	statistics    *usageStatistics
+	notifications *notificationRuntime
+	rebuildMu     sync.Mutex
 }
 
 // NewSQLiteStore 打开或创建用量数据库。
@@ -61,6 +62,10 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.initNotifications(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return store, nil
 }
 
@@ -93,5 +98,6 @@ func (s *SQLiteStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
+	s.stopNotifications()
 	return s.db.Close()
 }
