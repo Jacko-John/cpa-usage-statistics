@@ -12,12 +12,68 @@ import (
 func (s *SQLiteStore) initNotifications(ctx context.Context) error {
 	s.notifications = &notificationRuntime{settings: defaultNotificationSettings(), send: sendNotificationSMTP}
 	return s.withConn(ctx, func(conn *sql.Conn) error {
+		if err := restoreNotificationFirstPeriods(ctx, conn, time.Now().Unix()); err != nil {
+			return err
+		}
 		if err := s.loadNotificationState(ctx, conn); err != nil {
 			return err
 		}
 		_, err := conn.ExecContext(ctx, `UPDATE notification_periods SET status='unknown',error='发送期间进程停止，结果未知' WHERE status='sending'`)
 		return err
 	})
+}
+
+// restoreNotificationFirstPeriods 仅补齐旧版尚未结束、未封存且从未切换过的首段。
+func restoreNotificationFirstPeriods(ctx context.Context, conn *sql.Conn, now int64) error {
+	rows, err := conn.QueryContext(ctx, `SELECT s.id,s.start,s.schedule FROM notification_segments s
+ JOIN notification_subscriptions b ON b.id=s.subscription
+ WHERE s.until_at=0 AND s.cursor=s.start AND b.enabled=1 AND b.deleted=0
+ AND NOT EXISTS(SELECT 1 FROM notification_segments other WHERE other.subscription=s.subscription AND other.id!=s.id)
+ AND NOT EXISTS(SELECT 1 FROM notification_periods p WHERE p.segment=s.id AND p.status!='open')`)
+	if err != nil {
+		return err
+	}
+	type adjustment struct{ id, oldStart, start int64 }
+	var changes []adjustment
+	for rows.Next() {
+		var id, start int64
+		var encoded []byte
+		if err := rows.Scan(&id, &start, &encoded); err != nil {
+			rows.Close()
+			return err
+		}
+		var cfg notificationSettings
+		if err := json.Unmarshal(encoded, &cfg); err != nil {
+			rows.Close()
+			return err
+		}
+		if !cfg.Enabled || start == cfg.boundary(start, false) {
+			continue
+		}
+		begin := cfg.boundary(start-1, false)
+		if cfg.boundary(start-1, true) > now {
+			changes = append(changes, adjustment{id, start, begin})
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil || len(changes) == 0 {
+		return err
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, change := range changes {
+		if _, err := tx.ExecContext(ctx, `UPDATE notification_periods SET id=?,start=?,partial=0 WHERE segment=? AND start=? AND status='open'`, notificationPeriodID(change.id, change.start), change.start, change.id, change.oldStart); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE notification_segments SET start=?,cursor=? WHERE id=?`, change.start, change.start, change.id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) loadNotificationState(ctx context.Context, conn *sql.Conn) error {
@@ -234,7 +290,7 @@ func notificationSubscriptions(ctx context.Context, q sqlQueryer) ([]notificatio
 	return result, rows.Err()
 }
 
-func insertNotificationSegment(ctx context.Context, exec sqlExecer, sub notificationSubscription, cfg notificationSettings, at int64) error {
+func insertNotificationSegment(ctx context.Context, exec sqlExecer, sub notificationSubscription, cfg notificationSettings, now int64) error {
 	if !cfg.Enabled || !sub.Enabled || sub.Deleted {
 		return nil
 	}
@@ -242,7 +298,11 @@ func insertNotificationSegment(ctx context.Context, exec sqlExecer, sub notifica
 	if err != nil {
 		return err
 	}
-	_, err = exec.ExecContext(ctx, `INSERT INTO notification_segments(subscription,api_key,email,note,start,cursor,schedule) VALUES(?,?,?,?,?,?,?)`, sub.ID, sub.Key, sub.Email, sub.Note, at, at, encoded)
+	// 首次生效覆盖当前完整周期；后续恢复或计划变更仍从下一分钟开始。
+	_, err = exec.ExecContext(ctx, `INSERT INTO notification_segments(subscription,api_key,email,note,start,cursor,schedule)
+ SELECT ?,?,?,?,at,at,? FROM
+ (SELECT CASE WHEN EXISTS(SELECT 1 FROM notification_segments WHERE subscription=?) THEN ? ELSE ? END AS at)`,
+		sub.ID, sub.Key, sub.Email, sub.Note, encoded, sub.ID, floorUnix(now, 60)+60, cfg.boundary(now, false))
 	return err
 }
 
@@ -285,7 +345,7 @@ func (s *SQLiteStore) notificationSettingsPut(ctx context.Context, cfg notificat
 				return err
 			}
 			for _, sub := range subs {
-				if err := insertNotificationSegment(ctx, tx, sub, cfg, at); err != nil {
+				if err := insertNotificationSegment(ctx, tx, sub, cfg, now); err != nil {
 					return err
 				}
 			}
@@ -361,7 +421,7 @@ func (s *SQLiteStore) notificationSubscriptionPut(ctx context.Context, sub notif
 			if _, err := tx.ExecContext(ctx, `UPDATE notification_segments SET until_at=? WHERE subscription=? AND until_at=0`, at, id); err != nil {
 				return err
 			}
-			if err := insertNotificationSegment(ctx, tx, sub, s.notifications.settings, at); err != nil {
+			if err := insertNotificationSegment(ctx, tx, sub, s.notifications.settings, now); err != nil {
 				return err
 			}
 		}

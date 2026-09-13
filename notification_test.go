@@ -485,16 +485,22 @@ func TestNotificationWeeklyCatchupBeyondCache(t *testing.T) {
 	if requests != 4 || cost != 8 {
 		t.Fatal("historical windows lost or duplicated", requests, cost)
 	}
-	calls := 0
+	calls, delivered := 0, 0
 	s.notifications.send = func(_ context.Context, _ notificationSettings, mail notificationMail) (bool, error) {
 		calls++
-		if len(mail.Periods) != 10 {
-			t.Fatal("catch-up was not combined")
+		delivered += len(mail.Periods)
+		// 新首期产生额外的过渡快照，沿用单封最多十期的投递上限。
+		want := 10
+		if calls == 2 {
+			want = 1
+		}
+		if len(mail.Periods) != want {
+			t.Fatalf("catch-up was not combined: %d", len(mail.Periods))
 		}
 		return false, nil
 	}
-	if err := s.sendNotificationBatch(ctx); err != nil || calls != 1 {
-		t.Fatal(calls, err)
+	if err := s.sendNotificationBatch(ctx); err != nil || calls != 2 || delivered != 11 {
+		t.Fatal(calls, delivered, err)
 	}
 }
 
@@ -519,7 +525,7 @@ func TestNotificationPricingChangeFreezesDuePeriod(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, err := s.notificationHistoryGet(ctx, id, time.Now().Unix())
-	if err != nil || len(h.Periods) != 1 || h.Periods[0].End != end.Unix() || h.Periods[0].Cost != 2 || len(h.Current) != 1 || h.Current[0].Cost != 4 {
+	if err != nil || len(h.Periods) != 2 || h.Periods[1].Cost != 0 || h.Periods[0].End != end.Unix() || h.Periods[0].Cost != 2 || len(h.Current) != 1 || h.Current[0].Cost != 4 {
 		t.Fatal(h, err)
 	}
 	if _, err := s.db.Exec(`UPDATE notification_periods SET status='sending' WHERE id=?`, h.Periods[0].ID); err != nil {
