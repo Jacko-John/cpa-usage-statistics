@@ -11,6 +11,11 @@ import (
 	"time"
 )
 
+const createUsagePricingSQL = `CREATE TABLE IF NOT EXISTS usage_pricing (
+	name TEXT PRIMARY KEY,
+	config BLOB NOT NULL
+) WITHOUT ROWID`
+
 const statisticsRecordColumns = `timestamp, api_key, provider, model, source, auth_type, service_tier,
        latency_ms, ttft_ms, input_tokens, output_tokens, cached_tokens,
        cache_creation_tokens, total_tokens, failed`

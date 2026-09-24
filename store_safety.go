@@ -8,6 +8,48 @@ import (
 	"time"
 )
 
+const (
+	createSafetyStateSQL = `CREATE TABLE IF NOT EXISTS api_key_safety_state (
+		api_key TEXT PRIMARY KEY,
+		total_trigger_count INTEGER NOT NULL DEFAULT 0,
+		total_limit_count INTEGER NOT NULL DEFAULT 0,
+		recent_trigger_times BLOB NOT NULL DEFAULT X'',
+		blocked_until INTEGER NOT NULL DEFAULT 0,
+		active_limit_started_at INTEGER NOT NULL DEFAULT 0,
+		active_limit_usage_record_id TEXT NOT NULL DEFAULT '',
+		manual_disabled INTEGER NOT NULL DEFAULT 0
+	) WITHOUT ROWID`
+	createSafetyHistorySQL = `CREATE TABLE IF NOT EXISTS api_key_safety_history (
+		api_key TEXT NOT NULL,
+		occurred_at INTEGER NOT NULL,
+		usage_record_id TEXT NOT NULL,
+		blocked_until INTEGER NOT NULL DEFAULT 0,
+		manual_released_at INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (api_key, occurred_at, usage_record_id)
+	) WITHOUT ROWID`
+	createSafetyHistoryIndexSQL = `CREATE INDEX IF NOT EXISTS idx_safety_history_usage_record_id ON api_key_safety_history(usage_record_id)`
+)
+
+func (s *SQLiteStore) migrateSafetyStateSchema(ctx context.Context) error {
+	var exists int
+	if err := s.db.QueryRowContext(
+		ctx,
+		"SELECT COUNT(*) FROM pragma_table_info('api_key_safety_state') WHERE name = 'manual_disabled'",
+	).Scan(&exists); err != nil {
+		return fmt.Errorf("usage sqlite inspect safety state schema: %w", err)
+	}
+	if exists != 0 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `
+ALTER TABLE api_key_safety_state
+ADD COLUMN manual_disabled INTEGER NOT NULL DEFAULT 0
+`); err != nil {
+		return fmt.Errorf("usage sqlite migrate safety state schema: %w", err)
+	}
+	return nil
+}
+
 // InsertSafety 原子写入用量、安全历史和新的 Key 状态。
 func (s *SQLiteStore) InsertSafety(ctx context.Context, record Record, state SafetyState, history SafetyHistory) error {
 	if s == nil || s.db == nil {

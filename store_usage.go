@@ -40,14 +40,8 @@ func insertUsageRecord(ctx context.Context, exec sqlExecer, record Record) error
 	if record.Failed {
 		failed = 1
 	}
-	_, err := exec.ExecContext(ctx, `
-INSERT INTO usage_records (
-	id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
-	reasoning_effort, service_tier, latency_ms, ttft_ms,
-	input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
-	failed, failure_status_code, failure_body
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`,
+	_, err := exec.ExecContext(ctx, `INSERT INTO usage_records (`+usageRecordColumns+`)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.ID,
 		record.Timestamp.Unix(),
 		record.APIKey,
@@ -79,62 +73,20 @@ INSERT INTO usage_records (
 
 // Query 按 API Key（无 Key 时按 provider）和模型分组返回用量记录。
 func (s *SQLiteStore) Query(ctx context.Context, rng QueryRange) (APIUsage, error) {
-	if s == nil || s.db == nil {
-		return APIUsage{}, nil
-	}
-
-	query := `
-SELECT id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
-       reasoning_effort, service_tier, latency_ms, ttft_ms,
-       input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
-       failed, failure_status_code, failure_body
-FROM usage_records`
-	args := make([]any, 0, 2)
-	separator := " WHERE "
-	if rng.Start != nil && !rng.Start.IsZero() {
-		query += separator + "timestamp >= ?"
-		args = append(args, ceilUnixSecond(*rng.Start))
-		separator = " AND "
-	}
-	if rng.End != nil && !rng.End.IsZero() {
-		query += separator + "timestamp < ?"
-		args = append(args, ceilUnixSecond(*rng.End))
-	}
-	query += " ORDER BY timestamp ASC, id ASC"
-
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("usage sqlite query: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	result := APIUsage{}
-	for rows.Next() {
-		var detail RequestDetail
-		var apiKey string
-		if err := scanUsageDetail(rows, &apiKey, &detail); err != nil {
-			return nil, err
-		}
-		appendUsageDetail(result, groupingKey(apiKey, detail.Provider), normalizeModel(detail.Model), detail)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("usage sqlite rows: %w", err)
-	}
-	return result, nil
+	return s.queryUsage(ctx, rng, false, 0)
 }
 
-// QueryRecent 返回时间范围内最新的用量事件，limit 始终由调用方限制在 100 以内。
+// QueryRecent 返回时间范围内最新的最多 100 条用量事件。
 func (s *SQLiteStore) QueryRecent(ctx context.Context, rng QueryRange, limit int) (APIUsage, error) {
+	return s.queryUsage(ctx, rng, true, min(max(limit, 1), 100))
+}
+
+func (s *SQLiteStore) queryUsage(ctx context.Context, rng QueryRange, recent bool, limit int) (APIUsage, error) {
 	if s == nil || s.db == nil {
 		return APIUsage{}, nil
 	}
-	limit = min(max(limit, 1), 100)
-	query := `
-SELECT id, timestamp, api_key, provider, model, alias, source, auth_id, auth_index, auth_type, executor_type,
-       reasoning_effort, service_tier, latency_ms, ttft_ms,
-       input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
-       failed, failure_status_code, failure_body
-FROM usage_records`
+
+	query := "SELECT " + usageRecordColumns + " FROM usage_records"
 	args := make([]any, 0, 3)
 	separator := " WHERE "
 	if rng.Start != nil && !rng.Start.IsZero() {
@@ -146,12 +98,20 @@ FROM usage_records`
 		query += separator + "timestamp < ?"
 		args = append(args, ceilUnixSecond(*rng.End))
 	}
-	query += " ORDER BY timestamp DESC, id DESC LIMIT ?"
-	args = append(args, limit)
+	queryError := "usage sqlite query"
+	rowsError := "usage sqlite rows"
+	if recent {
+		query += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+		args = append(args, limit)
+		queryError = "usage sqlite query recent"
+		rowsError = "usage sqlite recent rows"
+	} else {
+		query += " ORDER BY timestamp ASC, id ASC"
+	}
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("usage sqlite query recent: %w", err)
+		return nil, fmt.Errorf("%s: %w", queryError, err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -165,7 +125,7 @@ FROM usage_records`
 		appendUsageDetail(result, groupingKey(apiKey, detail.Provider), normalizeModel(detail.Model), detail)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("usage sqlite recent rows: %w", err)
+		return nil, fmt.Errorf("%s: %w", rowsError, err)
 	}
 	return result, nil
 }

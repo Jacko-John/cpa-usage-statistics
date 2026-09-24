@@ -302,6 +302,96 @@ func TestToRecordMapping(t *testing.T) {
 	}
 }
 
+func TestUsageHandleKeepsDistinctIDsAcrossRestart(t *testing.T) {
+	previousSafety := safety
+	previousSchema := negotiatedSchemaVersion.Load()
+	previousRetention := retentionDays.Load()
+	safety = &safetyLimiter{states: make(map[string]SafetyState)}
+	t.Cleanup(func() {
+		closeStore()
+		safety = previousSafety
+		negotiatedSchemaVersion.Store(previousSchema)
+		retentionDays.Store(previousRetention)
+	})
+
+	dataDir := t.TempDir()
+	configureForSchemaTest(t, 1, dataDir)
+	payload := []byte(`{
+		"ID":"00000001",
+		"RequestID":"00000001",
+		"TraceID":"00000001",
+		"RequestedAt":"2026-09-24T09:00:00Z",
+		"APIKey":"client-key",
+		"Model":"model-a",
+		"Failed":true,
+		"Failure":{"StatusCode":403,"Body":"{\"error\":{\"code\":\"cyber_policy\"}}"}
+	}`)
+	if _, err := handleMethod("usage.handle", payload); err != nil {
+		t.Fatalf("first usage.handle: %v", err)
+	}
+	ctx := context.Background()
+	usage, err := currentStore().Query(ctx, QueryRange{})
+	if err != nil {
+		t.Fatalf("query before restart: %v", err)
+	}
+	first := usage["client-key"]["model-a"]
+	if len(first) != 1 || first[0].ID == "" || first[0].ID == "00000001" {
+		t.Fatalf("usage before restart = %+v", usage)
+	}
+	firstID := first[0].ID
+
+	closeStore()
+	configureForSchemaTest(t, 1, dataDir)
+	if _, err := handleMethod("usage.handle", payload); err != nil {
+		t.Fatalf("second usage.handle: %v", err)
+	}
+	store := currentStore()
+	usage, err = store.Query(ctx, QueryRange{})
+	if err != nil {
+		t.Fatalf("query after restart: %v", err)
+	}
+	details := usage["client-key"]["model-a"]
+	if len(details) != 2 {
+		t.Fatalf("usage after restart = %+v", usage)
+	}
+	ids := make(map[string]bool, 2)
+	for _, detail := range details {
+		if detail.ID == "" || detail.ID == "00000001" || ids[detail.ID] {
+			t.Fatalf("duplicate or upstream usage ID: %+v", details)
+		}
+		ids[detail.ID] = true
+	}
+	if !ids[firstID] {
+		t.Fatalf("original usage ID %q was lost after restart: %+v", firstID, details)
+	}
+
+	history, err := store.QuerySafetyHistory(ctx, SafetyHistoryQuery{APIKey: "client-key", Limit: 10})
+	if err != nil {
+		t.Fatalf("query safety history: %v", err)
+	}
+	if len(history) != 2 || !ids[history[0].UsageRecordID] || !ids[history[1].UsageRecordID] || history[0].UsageRecordID == history[1].UsageRecordID {
+		t.Fatalf("safety history after restart = %+v", history)
+	}
+	idsToDelete := NewStableStringSet(2)
+	for id := range ids {
+		idsToDelete.Add(id)
+	}
+	deleted, err := store.Delete(ctx, idsToDelete)
+	if err != nil {
+		t.Fatalf("delete safety-linked usage: %v", err)
+	}
+	if deleted.Deleted != 0 || len(deleted.Missing) != 2 {
+		t.Fatalf("safety-linked usage was deleted: %+v", deleted)
+	}
+	summary, err := store.usageSummaryJSON("all", time.Now().Unix())
+	if err != nil {
+		t.Fatalf("usage summary: %v", err)
+	}
+	if got := decodeUsageSummaryForTest(t, summary).TotalRequests; got != 2 {
+		t.Fatalf("usage summary requests = %d, want 2", got)
+	}
+}
+
 func TestParseConfig(t *testing.T) {
 	cfg := parseConfig([]byte("enabled: true\npriority: 120\ndata_dir: /tmp/usage\nretention_days: 45\n"))
 	if cfg.DataDir != "/tmp/usage" {
@@ -433,7 +523,7 @@ func TestMigrateSchemaAddsMissingColumns(t *testing.T) {
 		provider TEXT NOT NULL DEFAULT '',
 		model TEXT NOT NULL DEFAULT '',
 		source TEXT NOT NULL DEFAULT '',
-		latency_ms INTEGER NOT NULL DEFAULT 0,
+		latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
 		input_tokens INTEGER NOT NULL DEFAULT 0,
 		output_tokens INTEGER NOT NULL DEFAULT 0,
 		cached_tokens INTEGER NOT NULL DEFAULT 0,
@@ -453,6 +543,14 @@ func TestMigrateSchemaAddsMissingColumns(t *testing.T) {
 		t.Fatalf("NewSQLiteStore(old): %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+
+	var migratedSchema string
+	if err := store.db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_records'").Scan(&migratedSchema); err != nil {
+		t.Fatalf("query migrated schema: %v", err)
+	}
+	if strings.Contains(strings.ToUpper(migratedSchema), "CHECK") {
+		t.Fatalf("migrated schema contains CHECK: %s", migratedSchema)
+	}
 
 	ctx := context.Background()
 	cols, err := store.existingColumns(ctx)
@@ -515,5 +613,30 @@ func TestMigrateSchemaAddsMissingColumns(t *testing.T) {
 	if err := store.Insert(ctx, Record{ID: "new-1", Timestamp: time.Now(), APIKey: "k", Model: "m",
 		ReasoningEffort: "high", Tokens: TokenStats{InputTokens: 5, CacheCreationTokens: 3, TotalTokens: 8}}); err != nil {
 		t.Fatalf("Insert after migrate: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+	store, err = NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	usage, err = store.Query(ctx, QueryRange{})
+	if err != nil {
+		t.Fatalf("Query after reopen: %v", err)
+	}
+	details = usage["k"]["m"]
+	byID := make(map[string]RequestDetail, len(details))
+	for _, detail := range details {
+		byID[detail.ID] = detail
+	}
+	legacy, exists := byID["legacy-1"]
+	if len(details) != 2 || !exists || legacy.Timestamp.Unix() != wantTimestamp || legacy.Tokens.InputTokens != 11 || legacy.Tokens.CacheReadTokens != 0 {
+		t.Fatalf("legacy usage after reopen = %+v", usage)
+	}
+	newRecord, exists := byID["new-1"]
+	if !exists || newRecord.ReasoningEffort != "high" || newRecord.Tokens.CacheCreationTokens != 3 {
+		t.Fatalf("new usage after reopen = %+v", usage)
 	}
 }

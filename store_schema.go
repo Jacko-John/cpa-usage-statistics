@@ -45,29 +45,10 @@ const usageRecordColumns = `
 func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	statements := [...]string{
 		createUsageRecordsSQL,
-		`CREATE TABLE IF NOT EXISTS api_key_safety_state (
-			api_key TEXT PRIMARY KEY,
-			total_trigger_count INTEGER NOT NULL DEFAULT 0,
-			total_limit_count INTEGER NOT NULL DEFAULT 0,
-			recent_trigger_times BLOB NOT NULL DEFAULT X'',
-			blocked_until INTEGER NOT NULL DEFAULT 0,
-			active_limit_started_at INTEGER NOT NULL DEFAULT 0,
-			active_limit_usage_record_id TEXT NOT NULL DEFAULT '',
-			manual_disabled INTEGER NOT NULL DEFAULT 0
-		) WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS api_key_safety_history (
-			api_key TEXT NOT NULL,
-			occurred_at INTEGER NOT NULL,
-			usage_record_id TEXT NOT NULL,
-			blocked_until INTEGER NOT NULL DEFAULT 0,
-			manual_released_at INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY (api_key, occurred_at, usage_record_id)
-		) WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS usage_pricing (
-			name TEXT PRIMARY KEY,
-			config BLOB NOT NULL
-		) WITHOUT ROWID`,
-		`CREATE INDEX IF NOT EXISTS idx_safety_history_usage_record_id ON api_key_safety_history(usage_record_id)`,
+		createSafetyStateSQL,
+		createSafetyHistorySQL,
+		createUsagePricingSQL,
+		createSafetyHistoryIndexSQL,
 		notificationSchema,
 	}
 	for _, statement := range statements {
@@ -112,60 +93,40 @@ func (s *SQLiteStore) migrateSchema(ctx context.Context) error {
 		return err
 	}
 	additions := [...]struct {
-		name string
-		ddl  string
+		name       string
+		definition string
 	}{
-		{"api_key", `ALTER TABLE usage_records ADD COLUMN api_key TEXT NOT NULL DEFAULT ''`},
-		{"provider", `ALTER TABLE usage_records ADD COLUMN provider TEXT NOT NULL DEFAULT ''`},
-		{"model", `ALTER TABLE usage_records ADD COLUMN model TEXT NOT NULL DEFAULT ''`},
-		{"alias", `ALTER TABLE usage_records ADD COLUMN alias TEXT NOT NULL DEFAULT ''`},
-		{"source", `ALTER TABLE usage_records ADD COLUMN source TEXT NOT NULL DEFAULT ''`},
-		{"auth_id", `ALTER TABLE usage_records ADD COLUMN auth_id TEXT NOT NULL DEFAULT ''`},
-		{"auth_index", `ALTER TABLE usage_records ADD COLUMN auth_index TEXT NOT NULL DEFAULT ''`},
-		{"auth_type", `ALTER TABLE usage_records ADD COLUMN auth_type TEXT NOT NULL DEFAULT ''`},
-		{"executor_type", `ALTER TABLE usage_records ADD COLUMN executor_type TEXT NOT NULL DEFAULT ''`},
-		{"reasoning_effort", `ALTER TABLE usage_records ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''`},
-		{"service_tier", `ALTER TABLE usage_records ADD COLUMN service_tier TEXT NOT NULL DEFAULT ''`},
-		{"latency_ms", `ALTER TABLE usage_records ADD COLUMN latency_ms INTEGER NOT NULL DEFAULT 0`},
-		{"ttft_ms", `ALTER TABLE usage_records ADD COLUMN ttft_ms INTEGER NOT NULL DEFAULT 0`},
-		{"input_tokens", `ALTER TABLE usage_records ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0`},
-		{"output_tokens", `ALTER TABLE usage_records ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0`},
-		{"reasoning_tokens", `ALTER TABLE usage_records ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0`},
-		{"cached_tokens", `ALTER TABLE usage_records ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`},
-		{"cache_read_tokens", `ALTER TABLE usage_records ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`},
-		{"cache_creation_tokens", `ALTER TABLE usage_records ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0`},
-		{"total_tokens", `ALTER TABLE usage_records ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0`},
-		{"failed", `ALTER TABLE usage_records ADD COLUMN failed INTEGER NOT NULL DEFAULT 0`},
-		{"failure_status_code", `ALTER TABLE usage_records ADD COLUMN failure_status_code INTEGER NOT NULL DEFAULT 0`},
-		{"failure_body", `ALTER TABLE usage_records ADD COLUMN failure_body TEXT NOT NULL DEFAULT ''`},
+		{"api_key", `TEXT NOT NULL DEFAULT ''`},
+		{"provider", `TEXT NOT NULL DEFAULT ''`},
+		{"model", `TEXT NOT NULL DEFAULT ''`},
+		{"alias", `TEXT NOT NULL DEFAULT ''`},
+		{"source", `TEXT NOT NULL DEFAULT ''`},
+		{"auth_id", `TEXT NOT NULL DEFAULT ''`},
+		{"auth_index", `TEXT NOT NULL DEFAULT ''`},
+		{"auth_type", `TEXT NOT NULL DEFAULT ''`},
+		{"executor_type", `TEXT NOT NULL DEFAULT ''`},
+		{"reasoning_effort", `TEXT NOT NULL DEFAULT ''`},
+		{"service_tier", `TEXT NOT NULL DEFAULT ''`},
+		{"latency_ms", `INTEGER NOT NULL DEFAULT 0`},
+		{"ttft_ms", `INTEGER NOT NULL DEFAULT 0`},
+		{"input_tokens", `INTEGER NOT NULL DEFAULT 0`},
+		{"output_tokens", `INTEGER NOT NULL DEFAULT 0`},
+		{"reasoning_tokens", `INTEGER NOT NULL DEFAULT 0`},
+		{"cached_tokens", `INTEGER NOT NULL DEFAULT 0`},
+		{"cache_read_tokens", `INTEGER NOT NULL DEFAULT 0`},
+		{"cache_creation_tokens", `INTEGER NOT NULL DEFAULT 0`},
+		{"total_tokens", `INTEGER NOT NULL DEFAULT 0`},
+		{"failed", `INTEGER NOT NULL DEFAULT 0`},
+		{"failure_status_code", `INTEGER NOT NULL DEFAULT 0`},
+		{"failure_body", `TEXT NOT NULL DEFAULT ''`},
 	}
 	for _, addition := range additions {
 		if _, ok := existing[addition.name]; ok {
 			continue
 		}
-		if _, err := s.db.ExecContext(ctx, addition.ddl); err != nil {
+		if _, err := s.db.ExecContext(ctx, "ALTER TABLE usage_records ADD COLUMN "+addition.name+" "+addition.definition); err != nil {
 			return fmt.Errorf("usage sqlite migrate add %s: %w", addition.name, err)
 		}
-	}
-	return nil
-}
-
-func (s *SQLiteStore) migrateSafetyStateSchema(ctx context.Context) error {
-	var exists int
-	if err := s.db.QueryRowContext(
-		ctx,
-		"SELECT COUNT(*) FROM pragma_table_info('api_key_safety_state') WHERE name = 'manual_disabled'",
-	).Scan(&exists); err != nil {
-		return fmt.Errorf("usage sqlite inspect safety state schema: %w", err)
-	}
-	if exists != 0 {
-		return nil
-	}
-	if _, err := s.db.ExecContext(ctx, `
-ALTER TABLE api_key_safety_state
-ADD COLUMN manual_disabled INTEGER NOT NULL DEFAULT 0
-`); err != nil {
-		return fmt.Errorf("usage sqlite migrate safety state schema: %w", err)
 	}
 	return nil
 }
@@ -273,23 +234,3 @@ func (s *SQLiteStore) existingColumns(ctx context.Context) (map[string]struct{},
 	}
 	return columns, rows.Err()
 }
-
-const notificationSchema = `
-CREATE TABLE IF NOT EXISTS notification_settings (id INTEGER PRIMARY KEY, config BLOB NOT NULL, password TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS notification_subscriptions (
- id TEXT PRIMARY KEY, api_key TEXT NOT NULL UNIQUE, email TEXT NOT NULL, note TEXT NOT NULL,
- enabled INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS notification_segments (
- id INTEGER PRIMARY KEY AUTOINCREMENT, subscription TEXT NOT NULL, api_key TEXT NOT NULL,
- email TEXT NOT NULL, note TEXT NOT NULL, start INTEGER NOT NULL, until_at INTEGER NOT NULL DEFAULT 0,
- cursor INTEGER NOT NULL, schedule BLOB NOT NULL);
-CREATE TABLE IF NOT EXISTS notification_periods (
- id TEXT PRIMARY KEY, segment INTEGER NOT NULL, subscription TEXT NOT NULL, start INTEGER NOT NULL,
- end INTEGER NOT NULL, timezone TEXT NOT NULL, email TEXT NOT NULL, key_label TEXT NOT NULL, note TEXT NOT NULL,
- partial INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'open', requests INTEGER NOT NULL DEFAULT 0,
- tokens INTEGER NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0, unpriced INTEGER NOT NULL DEFAULT 0,
- attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
- skipped INTEGER NOT NULL DEFAULT 0, UNIQUE(segment,start));
-CREATE INDEX IF NOT EXISTS idx_notification_history ON notification_periods(subscription,end);
-CREATE INDEX IF NOT EXISTS idx_notification_outbox ON notification_periods(status,retry_at);
-`
