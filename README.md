@@ -562,6 +562,34 @@ SQLite 表不使用 `CHECK` 约束。请求数据写入前由 Go 对延迟、Tok
 
 安全历史查询先按小型历史表定位记录，再按 `usage_records.id` 主键关联模型、provider 和错误信息，不扫描大型用量表。普通请求热路径不会执行该查询。
 
+## 开发与模块结构
+
+根目录只保留 `main.go` 和 `abi_cgo.go`，负责发布时的版本信息注入及宿主 C ABI。业务代码按职责放在 `internal/`：
+
+| 模块 | 职责 |
+| --- | --- |
+| `plugin` | 宿主注册、生命周期、请求拦截、用量接收和管理路由 |
+| `config` | YAML 配置解析和数据库路径 |
+| `protocol` | 宿主请求、响应类型和 JSON 信封 |
+| `model` | 共享用量、安全数据类型及数值归一化 |
+| `storage` | SQLite 连接、迁移、用量与安全数据持久化、价格重算协调 |
+| `statistics` | 价格计算、增量聚合、时间桶和历史窗口补查 |
+| `notifications` | 设置、订阅、周期结算、历史、发件队列、SMTP 和邮件渲染 |
+| `safety` | API Key 提取、安全错误识别和限流状态变更 |
+
+`plugin` 负责组装各模块，业务模块不反向引用它。通知模块使用存储层的唯一连接；修改价格前，存储层通过结算接口按旧价格封存已结束的通知周期。数据库写入成功后才更新内存统计，关闭数据库前先停止并等待通知任务退出。
+
+测试随模块放置；`testfixture` 和 `testutil` 仅供测试使用。修改模块边界后运行：
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+CGO_ENABLED=1 go build -buildmode=c-shared -o /tmp/usage-statistics.so .
+```
+
+SMTP 测试启动本地 TLS 服务，不发送真实邮件。发布继续使用 `build.sh` 和 `package-release.sh`，版本变量仍为 `main.pluginVersion`、`main.pluginAuthor` 和 `main.pluginRepository`。后续修改规则见 [AGENTS.md](AGENTS.md)。
+
 ## 已知限制
 
 - 只支持请求头 API Key。

@@ -38,7 +38,12 @@ extern void cliproxyPluginShutdown(void);
 */
 import "C"
 
-import "unsafe"
+import (
+	"unsafe"
+
+	"github.com/Jacko-John/cpa-usage-statistics/internal/plugin"
+	"github.com/Jacko-John/cpa-usage-statistics/internal/protocol"
+)
 
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
@@ -60,7 +65,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		response.len = 0
 	}
 	if method == nil {
-		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
+		writeResponse(response, protocol.Error("invalid_method", "method is required"))
 		return 1
 	}
 	var req []byte
@@ -69,7 +74,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	raw, err := handleMethod(C.GoString(method), req)
 	if err != nil {
-		writeResponse(response, errorEnvelope("plugin_error", err.Error()))
+		writeResponse(response, protocol.Error("plugin_error", err.Error()))
 		return 1
 	}
 	writeResponse(response, raw)
@@ -86,7 +91,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
-	closeStore()
+	plugin.Close()
 }
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {

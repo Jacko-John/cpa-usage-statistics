@@ -1,0 +1,466 @@
+package storage
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	usagemodel "github.com/Jacko-John/cpa-usage-statistics/internal/model"
+)
+
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func TestSQLiteUsesWALAndUsageQueryIndex(t *testing.T) {
+	store := newTestStore(t)
+
+	var journalMode string
+	if err := store.db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatalf("query journal mode: %v", err)
+	}
+	if journalMode != "wal" {
+		t.Fatalf("journal mode = %q, want wal", journalMode)
+	}
+
+	indexes := map[string]bool{}
+	rows, err := store.db.Query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_records'")
+	if err != nil {
+		t.Fatalf("query usage indexes: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan usage index: %v", err)
+		}
+		indexes[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("usage index rows: %v", err)
+	}
+	if !indexes["idx_usage_records_timestamp_id"] {
+		t.Fatalf("usage indexes = %v", indexes)
+	}
+	if indexes["idx_usage_records_timestamp"] || indexes["idx_usage_records_api_model"] {
+		t.Fatalf("redundant usage indexes remain: %v", indexes)
+	}
+}
+
+func TestUsageTimestampUsesUnixSeconds(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 9, 1, 12, 0, 0, 250_000_000, time.UTC)
+	for _, record := range []usagemodel.Record{
+		{ID: "first", Timestamp: base, APIKey: "k", Model: "m"},
+		{ID: "second", Timestamp: base.Add(1500 * time.Millisecond), APIKey: "k", Model: "m"},
+	} {
+		if err := store.Insert(ctx, record); err != nil {
+			t.Fatalf("Insert %s: %v", record.ID, err)
+		}
+	}
+
+	var storageType string
+	var storedTimestamp int64
+	if err := store.db.QueryRow(
+		"SELECT typeof(timestamp), timestamp FROM usage_records WHERE id = ?",
+		"first",
+	).Scan(&storageType, &storedTimestamp); err != nil {
+		t.Fatalf("query stored timestamp: %v", err)
+	}
+	if storageType != "integer" || storedTimestamp != base.Unix() {
+		t.Fatalf("stored timestamp: type=%q value=%d", storageType, storedTimestamp)
+	}
+
+	start := time.Unix(base.Unix(), 500_000_000).UTC()
+	end := time.Unix(base.Unix()+1, 500_000_000).UTC()
+	usage, err := store.Query(ctx, usagemodel.QueryRange{Start: &start, End: &end})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	details := usage["k"]["m"]
+	if len(details) != 1 || details[0].ID != "second" || details[0].Timestamp.Unix() != base.Unix()+1 || details[0].Timestamp.Nanosecond() != 0 {
+		t.Fatalf("range details = %+v", details)
+	}
+	encoded, err := json.Marshal(details[0])
+	if err != nil {
+		t.Fatalf("marshal detail: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatalf("unmarshal detail: %v", err)
+	}
+	if _, ok := payload["timestamp"].(string); !ok {
+		t.Fatalf("timestamp JSON is not RFC3339 string: %s", encoded)
+	}
+}
+
+func TestInsertQueryDelete(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ts := time.Date(2026, 5, 2, 10, 30, 0, 0, time.UTC)
+	rec := usagemodel.Record{
+		ID: "record-1", Timestamp: ts, APIKey: "api-key-1", Provider: "anthropic",
+		Model: "claude-sonnet-4-5", Source: "claude-code", AuthIndex: "auth-1",
+		ReasoningEffort: "high", ServiceTier: "priority", LatencyMs: 1250, TTFTMs: 200,
+		Tokens: usagemodel.TokenStats{InputTokens: 10, OutputTokens: 20, ReasoningTokens: 3, CachedTokens: 4, CacheReadTokens: 1, CacheCreationTokens: 2, TotalTokens: 33},
+		Failed: true, FailureStatusCode: 429, FailureBody: "rate limited",
+	}
+	if err := store.Insert(ctx, rec); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	usage, err := store.Query(ctx, usagemodel.QueryRange{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	details := usage["api-key-1"]["claude-sonnet-4-5"]
+	if len(details) != 1 {
+		t.Fatalf("details len = %d payload=%v", len(details), usage)
+	}
+	d := details[0]
+	if d.ID != "record-1" || d.ReasoningEffort != "high" || d.TTFTMs != 200 || d.LatencyMs != 1250 {
+		t.Fatalf("detail = %+v", d)
+	}
+	if d.Tokens.CacheReadTokens != 1 || d.Tokens.CacheCreationTokens != 2 || d.Tokens.TotalTokens != 33 {
+		t.Fatalf("tokens = %+v", d.Tokens)
+	}
+	if !d.Failed || d.FailureStatusCode != 429 || d.FailureBody != "rate limited" {
+		t.Fatalf("failure = %+v", d)
+	}
+
+	ids := usagemodel.NewStableStringSet(2)
+	ids.Add("record-1")
+	ids.Add("missing")
+	res, err := store.Delete(ctx, ids)
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if res.Deleted != 1 || len(res.Missing) != 1 || res.Missing[0] != "missing" {
+		t.Fatalf("delete result = %+v", res)
+	}
+}
+
+func TestDeleteBatchesAndReportsMissingInOrder(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	idValues := make([]string, 501)
+	ids := usagemodel.NewStableStringSet(len(idValues))
+	for i := range idValues {
+		idValues[i] = fmt.Sprintf("record-%03d", i)
+		ids.Add(idValues[i])
+	}
+	for _, id := range []string{idValues[0], idValues[500]} {
+		if err := store.Insert(ctx, usagemodel.Record{ID: id, Timestamp: time.Now()}); err != nil {
+			t.Fatalf("Insert %s: %v", id, err)
+		}
+	}
+
+	res, err := store.Delete(ctx, ids)
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if res.Deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", res.Deleted)
+	}
+	if len(res.Missing) != 499 {
+		t.Fatalf("missing len = %d, want 499", len(res.Missing))
+	}
+	if res.Missing[0] != idValues[1] || res.Missing[498] != idValues[499] {
+		t.Fatalf("missing order is incorrect: first=%q last=%q", res.Missing[0], res.Missing[len(res.Missing)-1])
+	}
+}
+
+func TestQueryFiltersByRange(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	start := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 5, 2, 11, 0, 0, 0, time.UTC)
+	records := []usagemodel.Record{
+		{ID: "before", Timestamp: start.Add(-time.Minute), APIKey: "k", Model: "m"},
+		{ID: "in", Timestamp: start.Add(30 * time.Minute), APIKey: "k", Model: "m"},
+		{ID: "after", Timestamp: end.Add(time.Minute), APIKey: "k", Model: "m"},
+	}
+	for i := range records {
+		if err := store.Insert(ctx, records[i]); err != nil {
+			t.Fatalf("Insert %s: %v", records[i].ID, err)
+		}
+	}
+	usage, err := store.Query(ctx, usagemodel.QueryRange{Start: &start, End: &end})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	details := usage["k"]["m"]
+	if len(details) != 1 || details[0].ID != "in" {
+		t.Fatalf("range filter = %+v", usage)
+	}
+}
+
+func TestDeleteBefore(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	old := time.Now().Add(-48 * time.Hour)
+	recent := time.Now().Add(-time.Hour)
+	if err := store.Insert(ctx, usagemodel.Record{ID: "old", Timestamp: old, APIKey: "k", Model: "m"}); err != nil {
+		t.Fatalf("Insert old: %v", err)
+	}
+	if err := store.Insert(ctx, usagemodel.Record{ID: "recent", Timestamp: recent, APIKey: "k", Model: "m"}); err != nil {
+		t.Fatalf("Insert recent: %v", err)
+	}
+	n, err := store.DeleteBefore(ctx, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("DeleteBefore: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("deleted = %d, want 1", n)
+	}
+	usage, _ := store.Query(ctx, usagemodel.QueryRange{})
+	if len(usage["k"]["m"]) != 1 {
+		t.Fatalf("remaining = %+v", usage)
+	}
+}
+
+func TestSQLiteSchemaHasNoChecksAndGoNormalizesValues(t *testing.T) {
+	store := newTestStore(t)
+	for _, table := range []string{"usage_records", "api_key_safety_state", "api_key_safety_history", "usage_pricing"} {
+		var schema string
+		if err := store.db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&schema); err != nil {
+			t.Fatalf("query schema for %s: %v", table, err)
+		}
+		if strings.Contains(strings.ToUpper(schema), "CHECK") {
+			t.Fatalf("schema for %s contains CHECK: %s", table, schema)
+		}
+	}
+
+	if err := store.Insert(context.Background(), usagemodel.Record{
+		ID:                "normalized",
+		Timestamp:         time.Now(),
+		LatencyMs:         -1,
+		TTFTMs:            -2,
+		Tokens:            usagemodel.TokenStats{InputTokens: -3, OutputTokens: -4, TotalTokens: -5},
+		FailureStatusCode: -400,
+	}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	var latency, ttft, input, output, total, status int64
+	if err := store.db.QueryRow(`
+SELECT latency_ms, ttft_ms, input_tokens, output_tokens, total_tokens, failure_status_code
+FROM usage_records WHERE id = 'normalized'
+`).Scan(&latency, &ttft, &input, &output, &total, &status); err != nil {
+		t.Fatalf("query normalized values: %v", err)
+	}
+	if latency != 0 || ttft != 0 || input != 0 || output != 0 || total != 0 || status != 0 {
+		t.Fatalf("normalized values = %d %d %d %d %d %d", latency, ttft, input, output, total, status)
+	}
+}
+
+func TestMigrateRemovesSQLiteChecksAndAddsManualDisabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checked.db")
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open old: %v", err)
+	}
+	checkedSchema := strings.Replace(
+		CreateUsageRecordsSQL,
+		"latency_ms INTEGER NOT NULL DEFAULT 0,",
+		"latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),",
+		1,
+	)
+	if _, err := old.Exec(checkedSchema); err != nil {
+		t.Fatalf("create checked usage table: %v", err)
+	}
+	if _, err := old.Exec("INSERT INTO usage_records (id, timestamp, api_key, model, latency_ms) VALUES (?, ?, ?, ?, ?)", "legacy", 100, "client-key", "model", 7); err != nil {
+		t.Fatalf("insert checked usage: %v", err)
+	}
+	if _, err := old.Exec(`CREATE TABLE api_key_safety_state (
+		api_key TEXT PRIMARY KEY,
+		total_trigger_count INTEGER NOT NULL DEFAULT 0,
+		total_limit_count INTEGER NOT NULL DEFAULT 0,
+		recent_trigger_times BLOB NOT NULL DEFAULT X'',
+		blocked_until INTEGER NOT NULL DEFAULT 0,
+		active_limit_started_at INTEGER NOT NULL DEFAULT 0,
+		active_limit_usage_record_id TEXT NOT NULL DEFAULT ''
+	) WITHOUT ROWID`); err != nil {
+		t.Fatalf("create old safety state: %v", err)
+	}
+	if _, err := old.Exec("INSERT INTO api_key_safety_state (api_key, total_trigger_count) VALUES ('client-key', 1)"); err != nil {
+		t.Fatalf("insert old safety state: %v", err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("close old: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var schema string
+	if err := store.db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_records'").Scan(&schema); err != nil {
+		t.Fatalf("query migrated schema: %v", err)
+	}
+	if strings.Contains(strings.ToUpper(schema), "CHECK") {
+		t.Fatalf("migrated schema contains CHECK: %s", schema)
+	}
+	var latency int64
+	if err := store.db.QueryRow("SELECT latency_ms FROM usage_records WHERE id = 'legacy'").Scan(&latency); err != nil || latency != 7 {
+		t.Fatalf("migrated usage latency = %d, err=%v", latency, err)
+	}
+	states, err := store.LoadSafetyStates(context.Background())
+	if err != nil {
+		t.Fatalf("LoadSafetyStates: %v", err)
+	}
+	state, exists := states["client-key"]
+	if !exists || state.ManualDisabled || state.TotalTriggerCount != 1 {
+		t.Fatalf("migrated safety state = %+v, exists=%v", state, exists)
+	}
+}
+
+// TestMigrateSchemaAddsMissingColumns 验证 schema 自愈：用一个缺少多列的老表
+// 打开 store，NewSQLiteStore 应通过 migrateSchema 补齐所有最新列，且老数据保留、
+// 补列后可正常读写。
+func TestMigrateSchemaAddsMissingColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+
+	// 建一个只有早期少数列的老表（缺 alias/auth_id/executor_type/reasoning_effort/
+	// service_tier/ttft_ms/reasoning_tokens/cache_read_tokens/cache_creation_tokens/
+	// failed/failure_* 等）。
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open old: %v", err)
+	}
+	if _, err := old.Exec(`CREATE TABLE usage_records (
+		id TEXT PRIMARY KEY,
+		timestamp TEXT NOT NULL,
+		api_key TEXT NOT NULL DEFAULT '',
+		provider TEXT NOT NULL DEFAULT '',
+		model TEXT NOT NULL DEFAULT '',
+		source TEXT NOT NULL DEFAULT '',
+		latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+		input_tokens INTEGER NOT NULL DEFAULT 0,
+		output_tokens INTEGER NOT NULL DEFAULT 0,
+		cached_tokens INTEGER NOT NULL DEFAULT 0,
+		total_tokens INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		t.Fatalf("create old table: %v", err)
+	}
+	if _, err := old.Exec(`INSERT INTO usage_records (id, timestamp, api_key, model, input_tokens, total_tokens) VALUES (?, ?, ?, ?, ?, ?)`,
+		"legacy-1", "2026-05-02T10:30:00.999999999Z", "k", "m", 11, 11); err != nil {
+		t.Fatalf("insert legacy: %v", err)
+	}
+	_ = old.Close()
+
+	// 用插件打开：应触发 migrateSchema 补齐所有缺列。
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore(old): %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	var migratedSchema string
+	if err := store.db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_records'").Scan(&migratedSchema); err != nil {
+		t.Fatalf("query migrated schema: %v", err)
+	}
+	if strings.Contains(strings.ToUpper(migratedSchema), "CHECK") {
+		t.Fatalf("migrated schema contains CHECK: %s", migratedSchema)
+	}
+
+	ctx := context.Background()
+	cols, err := store.ExistingColumns(ctx)
+	if err != nil {
+		t.Fatalf("existingColumns: %v", err)
+	}
+	for _, want := range []string{
+		"alias", "auth_id", "auth_index", "auth_type", "executor_type",
+		"reasoning_effort", "service_tier", "ttft_ms",
+		"reasoning_tokens", "cache_read_tokens", "cache_creation_tokens",
+		"failed", "failure_status_code", "failure_body",
+	} {
+		if _, ok := cols[want]; !ok {
+			t.Fatalf("column %q not added by migrateSchema", want)
+		}
+	}
+
+	var timestampType string
+	if err := store.db.QueryRow(
+		"SELECT type FROM pragma_table_info('usage_records') WHERE name = 'timestamp'",
+	).Scan(&timestampType); err != nil {
+		t.Fatalf("query timestamp type: %v", err)
+	}
+	var migratedTimestamp int64
+	if err := store.db.QueryRow("SELECT timestamp FROM usage_records WHERE id = 'legacy-1'").Scan(&migratedTimestamp); err != nil {
+		t.Fatalf("query migrated timestamp: %v", err)
+	}
+	wantTimestamp := time.Date(2026, 5, 2, 10, 30, 0, 0, time.UTC).Unix()
+	if timestampType != "INTEGER" || migratedTimestamp != wantTimestamp {
+		t.Fatalf("migrated timestamp: type=%q value=%d want=%d", timestampType, migratedTimestamp, wantTimestamp)
+	}
+
+	for _, table := range []string{"api_key_safety_state", "api_key_safety_history"} {
+		var count int
+		if err := store.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&count); err != nil {
+			t.Fatalf("query safety table %s: %v", table, err)
+		}
+		if count != 1 {
+			t.Fatalf("safety table %s was not created during migration", table)
+		}
+	}
+
+	// 老数据保留，且能按新 schema 查询；补出的新列取默认值。
+	usage, err := store.Query(ctx, usagemodel.QueryRange{})
+	if err != nil {
+		t.Fatalf("Query after migrate: %v", err)
+	}
+	details := usage["k"]["m"]
+	if len(details) != 1 || details[0].ID != "legacy-1" {
+		t.Fatalf("legacy row lost: %+v", usage)
+	}
+	if details[0].Tokens.InputTokens != 11 {
+		t.Fatalf("legacy input tokens = %d", details[0].Tokens.InputTokens)
+	}
+	if details[0].Tokens.CacheReadTokens != 0 || details[0].Tokens.CacheCreationTokens != 0 {
+		t.Fatalf("new cache cols should default 0: %+v", details[0].Tokens)
+	}
+
+	// 补列后仍可正常写入含新字段的数据。
+	if err := store.Insert(ctx, usagemodel.Record{ID: "new-1", Timestamp: time.Now(), APIKey: "k", Model: "m",
+		ReasoningEffort: "high", Tokens: usagemodel.TokenStats{InputTokens: 5, CacheCreationTokens: 3, TotalTokens: 8}}); err != nil {
+		t.Fatalf("Insert after migrate: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+	store, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	usage, err = store.Query(ctx, usagemodel.QueryRange{})
+	if err != nil {
+		t.Fatalf("Query after reopen: %v", err)
+	}
+	details = usage["k"]["m"]
+	byID := make(map[string]usagemodel.RequestDetail, len(details))
+	for _, detail := range details {
+		byID[detail.ID] = detail
+	}
+	legacy, exists := byID["legacy-1"]
+	if len(details) != 2 || !exists || legacy.Timestamp.Unix() != wantTimestamp || legacy.Tokens.InputTokens != 11 || legacy.Tokens.CacheReadTokens != 0 {
+		t.Fatalf("legacy usage after reopen = %+v", usage)
+	}
+	newRecord, exists := byID["new-1"]
+	if !exists || newRecord.ReasoningEffort != "high" || newRecord.Tokens.CacheCreationTokens != 3 {
+		t.Fatalf("new usage after reopen = %+v", usage)
+	}
+}
