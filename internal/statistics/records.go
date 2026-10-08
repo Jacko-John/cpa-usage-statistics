@@ -38,6 +38,7 @@ func (s *Engine) APIWindows(ctx context.Context, queryer Queryer, queries []APIW
 	limit := FloorUnix(now, StatisticsMinute) + StatisticsMinute
 	start, end := limit, int64(0)
 	byAPI := make(map[string][]int)
+	windows := make([]apiWindowAccumulator, len(queries))
 	for _, i := range missing {
 		query := queries[i]
 		start = min(start, query.Start)
@@ -63,16 +64,20 @@ FROM usage_records WHERE timestamp >= ? AND timestamp < ?`, start, end)
 			if record.Timestamp < query.Start || record.Timestamp >= query.End {
 				continue
 			}
-			metric := &results[i]
-			metric.Requests++
-			metric.Tokens += record.TotalTokens
-			metric.Cost += cost
+			var unpriced int64
 			if !priced {
-				metric.Unpriced++
+				unpriced = 1
 			}
+			windows[i].add(usagemodel.NormalizeModel(record.Model), normalizeServiceTier(record.ServiceTier), 1, record.TotalTokens, cost, unpriced)
 		}
 	})
-	return results, err
+	if err != nil {
+		return nil, err
+	}
+	for _, i := range missing {
+		results[i] = windows[i].summary()
+	}
+	return results, nil
 }
 
 func ScanStatisticsRecords(

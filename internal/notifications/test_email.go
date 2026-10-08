@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"time"
+
+	"github.com/Jacko-John/cpa-usage-statistics/internal/statistics"
 )
 
 type SendResult struct {
@@ -29,6 +31,11 @@ func (s *Service) TestEmail(ctx context.Context, email string) (SendResult, erro
 		Start: cfg.Boundary(end-1, false), End: end, Timezone: cfg.Timezone,
 		KeyLabel: notificationMask("sk-9f2b7k4m6q8r3c1a7x9q"), Note: "个人项目",
 		Requests: 1280, Tokens: 2_468_000, Cost: 12.3456,
+		Details: []statistics.APIWindowDetail{
+			{Model: "claude-sonnet", ServiceTier: "standard", Requests: 240, Tokens: 368_000, Cost: 2},
+			{Model: "gpt-5", ServiceTier: "default", Requests: 800, Tokens: 1_600_000, Cost: 6},
+			{Model: "gpt-5", ServiceTier: "priority", Requests: 240, Tokens: 500_000, Cost: 4.3456},
+		},
 	}
 	unknown, err := s.send(ctx, cfg, Mail{ID: notificationID(), To: email, Periods: []Period{sample}})
 	return SendResult{Unknown: unknown, Err: err}, nil

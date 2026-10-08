@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -87,8 +86,8 @@ func New(ctx context.Context, store *storage.Store, send Sender) (*Service, erro
 	}
 	s := &Service{store: store, settings: DefaultSettings(), send: send}
 	err := s.store.WithConn(ctx, func(conn *sql.Conn) error {
-		if _, err := conn.ExecContext(ctx, notificationSchema); err != nil {
-			return fmt.Errorf("usage sqlite init schema: %w", err)
+		if err := initNotificationSchema(ctx, conn); err != nil {
+			return err
 		}
 		if err := restoreNotificationFirstPeriods(ctx, conn, time.Now().Unix()); err != nil {
 			return err

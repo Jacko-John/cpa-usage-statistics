@@ -17,6 +17,12 @@ type notificationEmailPeriod struct {
 	Title, KeyLabel, Start, End, Timezone string
 	Cost, Unit, Requests, Tokens          string
 	Unpriced, Partial, Skipped            string
+	DetailsNotice                         string
+	Details                               []notificationEmailDetail
+}
+
+type notificationEmailDetail struct {
+	Model, ServiceTier, Requests, Tokens, Cost, Unpriced string
 }
 
 const notificationEmailIntro = "本期用量已整理好，请查收你的使用情况。"
@@ -27,6 +33,13 @@ func notificationNumber(value int64) string {
 		text = text[:i] + "," + text[i:]
 	}
 	return text
+}
+
+func notificationCost(requests, unpriced int64, cost float64, precision int) string {
+	if requests > 0 && unpriced == requests {
+		return "暂无法估算"
+	}
+	return fmt.Sprintf("$%.*f", precision, cost)
 }
 
 func notificationEmailData(mail Mail) notificationEmail {
@@ -40,7 +53,7 @@ func notificationEmailData(mail Mail) notificationEmail {
 			Title: period.Note, KeyLabel: period.KeyLabel, Timezone: period.Timezone,
 			Start: time.Unix(period.Start, 0).In(loc).Format("2006/01/02 15:04"),
 			End:   time.Unix(period.End, 0).In(loc).Format("2006/01/02 15:04"),
-			Cost:  fmt.Sprintf("$%.4f", period.Cost), Unit: "USD",
+			Cost:  notificationCost(period.Requests, period.Unpriced, period.Cost, 4), Unit: "USD",
 			Requests: notificationNumber(period.Requests), Tokens: notificationNumber(period.Tokens),
 		}
 		if item.Title == "" {
@@ -49,7 +62,7 @@ func notificationEmailData(mail Mail) notificationEmail {
 		if period.Unpriced > 0 {
 			item.Unpriced = fmt.Sprintf("有 %s 次请求尚未计价，当前金额不包含这部分费用。", notificationNumber(period.Unpriced))
 			if period.Unpriced == period.Requests {
-				item.Cost, item.Unit = "暂无法估算", ""
+				item.Unit = ""
 			}
 		}
 		if period.Partial {
@@ -57,6 +70,25 @@ func notificationEmailData(mail Mail) notificationEmail {
 		}
 		if period.Skipped > 0 {
 			item.Skipped = fmt.Sprintf("更早的 %s 个周期未包含在本次报告中。", notificationNumber(period.Skipped))
+		}
+		if period.Details == nil {
+			item.DetailsNotice = "此历史周期未保存使用明细。"
+		} else if len(period.Details) == 0 {
+			item.DetailsNotice = "本期没有使用记录。"
+		}
+		for _, detail := range period.Details {
+			row := notificationEmailDetail{
+				Model: detail.Model, ServiceTier: detail.ServiceTier,
+				Requests: notificationNumber(detail.Requests), Tokens: notificationNumber(detail.Tokens),
+				Cost: notificationCost(detail.Requests, detail.Unpriced, detail.Cost, 6),
+			}
+			if row.ServiceTier == "" {
+				row.ServiceTier = "未提供"
+			}
+			if detail.Unpriced > 0 {
+				row.Unpriced = fmt.Sprintf("%s 次请求未计价", notificationNumber(detail.Unpriced))
+			}
+			item.Details = append(item.Details, row)
 		}
 		result.Periods = append(result.Periods, item)
 	}
@@ -71,6 +103,16 @@ func notificationEmailText(data notificationEmail) string {
 		for _, notice := range []string{period.Unpriced, period.Partial, period.Skipped} {
 			if notice != "" {
 				fmt.Fprintf(&body, "%s\r\n", notice)
+			}
+		}
+		fmt.Fprint(&body, "\r\n使用明细（按模型和 Service tier 汇总）\r\n")
+		if period.DetailsNotice != "" {
+			fmt.Fprintf(&body, "%s\r\n", period.DetailsNotice)
+		}
+		for _, detail := range period.Details {
+			fmt.Fprintf(&body, "模型：%s | Service tier：%s | 请求：%s | Token：%s | 费用（USD）：%s\r\n", detail.Model, detail.ServiceTier, detail.Requests, detail.Tokens, detail.Cost)
+			if detail.Unpriced != "" {
+				fmt.Fprintf(&body, "%s\r\n", detail.Unpriced)
 			}
 		}
 	}
@@ -120,6 +162,22 @@ var notificationEmailHTML = template.Must(template.New("notification").Parse(`<!
 </tr></table>
 {{if .Partial}}<p style="margin:16px 0 0;color:#66738a;font-size:12px;line-height:1.8;">{{.Partial}}</p>{{end}}
 {{if .Skipped}}<p style="margin:12px 0 0;color:#66738a;font-size:12px;line-height:1.8;">{{.Skipped}}</p>{{end}}
+</td></tr>
+<tr><td style="padding:0 18px 20px;">
+<h3 style="margin:0 0 12px;color:#334155;font-size:14px;font-weight:600;line-height:1.6;">使用明细</h3>
+{{if .DetailsNotice}}<p style="margin:0;color:#66738a;font-size:12px;line-height:1.8;">{{.DetailsNotice}}</p>{{else}}
+<table width="100%" cellpadding="0" cellspacing="0" border="0" style="table-layout:fixed;border-collapse:collapse;font-size:12px;line-height:1.7;">
+<thead><tr style="background-color:#f7f8fc;color:#66738a;">
+<th scope="col" width="44%" align="left" style="padding:8px;font-weight:500;">模型</th>
+<th scope="col" width="24%" align="left" style="padding:8px;font-weight:500;">Service tier</th>
+<th scope="col" width="32%" align="right" style="padding:8px;font-weight:500;">费用（USD）</th>
+</tr></thead>
+<tbody>{{range .Details}}<tr>
+<td valign="top" style="padding:10px 8px;border-bottom:1px solid #e9edf4;overflow-wrap:anywhere;word-break:break-word;"><strong style="font-weight:500;">{{.Model}}</strong><br><span style="color:#66738a;font-size:11px;">请求 {{.Requests}} · Token {{.Tokens}}</span></td>
+<td valign="top" style="padding:10px 8px;border-bottom:1px solid #e9edf4;overflow-wrap:anywhere;word-break:break-word;">{{.ServiceTier}}</td>
+<td valign="top" align="right" style="padding:10px 8px;border-bottom:1px solid #e9edf4;overflow-wrap:anywhere;word-break:break-word;">{{.Cost}}{{if .Unpriced}}<br><span style="color:#8a5700;font-size:11px;">{{.Unpriced}}</span>{{end}}</td>
+</tr>{{end}}</tbody>
+</table>{{end}}
 </td></tr>
 </table>
 </td></tr>

@@ -88,23 +88,24 @@ func restoreNotificationFirstPeriods(ctx context.Context, conn *sql.Conn, now in
 func notificationPeriodID(segment, start int64) string { return fmt.Sprintf("%d-%d", segment, start) }
 
 type Period struct {
-	ID       string  `json:"id"`
-	Start    int64   `json:"start"`
-	End      int64   `json:"end"`
-	Timezone string  `json:"timezone"`
-	Email    string  `json:"email"`
-	KeyLabel string  `json:"key_label"`
-	Note     string  `json:"note"`
-	Partial  bool    `json:"partial"`
-	Status   string  `json:"status"`
-	Requests int64   `json:"requests"`
-	Tokens   int64   `json:"tokens"`
-	Cost     float64 `json:"cost"`
-	Unpriced int64   `json:"unpriced_requests"`
-	Attempts int     `json:"attempts"`
-	RetryAt  int64   `json:"retry_at"`
-	Error    string  `json:"error"`
-	Skipped  int64   `json:"skipped_cycles"`
+	ID       string                       `json:"id"`
+	Start    int64                        `json:"start"`
+	End      int64                        `json:"end"`
+	Timezone string                       `json:"timezone"`
+	Email    string                       `json:"email"`
+	KeyLabel string                       `json:"key_label"`
+	Note     string                       `json:"note"`
+	Partial  bool                         `json:"partial"`
+	Status   string                       `json:"status"`
+	Requests int64                        `json:"requests"`
+	Tokens   int64                        `json:"tokens"`
+	Cost     float64                      `json:"cost"`
+	Unpriced int64                        `json:"unpriced_requests"`
+	Details  []statistics.APIWindowDetail `json:"details"`
+	Attempts int                          `json:"attempts"`
+	RetryAt  int64                        `json:"retry_at"`
+	Error    string                       `json:"error"`
+	Skipped  int64                        `json:"skipped_cycles"`
 }
 
 func ensureNotificationPeriod(ctx context.Context, exec storage.SQLExecer, seg notificationSegment, start, end int64) error {
@@ -198,7 +199,11 @@ func (s *Service) Settle(ctx context.Context, conn *sql.Conn, now int64) error {
 			status = "cancelled"
 		}
 		amount := amounts[i]
-		if _, err := tx.ExecContext(ctx, `UPDATE notification_periods SET status=?,requests=?,tokens=?,cost=?,unpriced=?,skipped=? WHERE id=? AND status='open'`, status, amount.Requests, amount.Tokens, amount.Cost, amount.Unpriced, period.skipped, notificationPeriodID(period.segment.ID, period.start)); err != nil {
+		details, err := json.Marshal(amount.Details)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE notification_periods SET status=?,requests=?,tokens=?,cost=?,unpriced=?,skipped=?,details=? WHERE id=? AND status='open'`, status, amount.Requests, amount.Tokens, amount.Cost, amount.Unpriced, period.skipped, details, notificationPeriodID(period.segment.ID, period.start)); err != nil {
 			return err
 		}
 	}

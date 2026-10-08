@@ -119,6 +119,7 @@ type APIWindowSummary struct {
 	Tokens   int64
 	Cost     float64
 	Unpriced int64
+	Details  []APIWindowDetail
 }
 
 func (s *Engine) apiWindows(queries []APIWindowQuery, now int64) ([]APIWindowSummary, []int, Pricing) {

@@ -35,10 +35,11 @@ const (
 )
 
 type usageBucketDimension struct {
-	Metric    usageBucketAggregate
-	Primary   usageDimensionID
-	Secondary usageDimensionID
-	Kind      usageBucketDimensionKind
+	Metric      usageBucketAggregate
+	Primary     usageDimensionID
+	Secondary   usageDimensionID
+	Kind        usageBucketDimensionKind
+	ServiceTier string
 }
 
 // usageMinuteBucket 使用扁平维度切片，避免每分钟建立多层 Map 和指针对象。
@@ -160,7 +161,7 @@ func (bucket *usageMinuteBucket) add(contribution *usageRecordContribution) {
 		dimension := &bucket.Dimensions[index]
 		switch dimension.Kind {
 		case usageBucketModel:
-			if dimension.Primary == contribution.APIID && dimension.Secondary == contribution.ModelID {
+			if dimension.Primary == contribution.APIID && dimension.Secondary == contribution.ModelID && dimension.ServiceTier == contribution.ServiceTier {
 				modelIndex = index
 			}
 		case usageBucketCredential:
@@ -174,10 +175,11 @@ func (bucket *usageMinuteBucket) add(contribution *usageRecordContribution) {
 		bucket.Dimensions[modelIndex].Metric.add(&contribution.UsageAggregate)
 	} else {
 		bucket.Dimensions = append(bucket.Dimensions, usageBucketDimension{
-			Metric:    newUsageBucketAggregate(&contribution.UsageAggregate),
-			Primary:   contribution.APIID,
-			Secondary: contribution.ModelID,
-			Kind:      usageBucketModel,
+			Metric:      newUsageBucketAggregate(&contribution.UsageAggregate),
+			Primary:     contribution.APIID,
+			Secondary:   contribution.ModelID,
+			Kind:        usageBucketModel,
+			ServiceTier: strings.Clone(contribution.ServiceTier),
 		})
 	}
 	if contribution.CredentialID == 0 {
@@ -385,7 +387,8 @@ func (bucket *usageMinuteBucket) subtract(
 			dimension := &bucket.Dimensions[index]
 			if dimension.Kind != removedDimension.Kind ||
 				dimension.Primary != primary ||
-				dimension.Secondary != secondary {
+				dimension.Secondary != secondary ||
+				dimension.ServiceTier != removedDimension.ServiceTier {
 				continue
 			}
 			dimension.Metric.subtract(&removedDimension.Metric)
@@ -537,7 +540,7 @@ func (metric credentialWindowMetric) empty() bool {
 
 // apiWindows 一次遍历相关分钟桶；超出缓存的窗口整段交给持久化查询。
 func (state *Accumulator) apiWindows(queries []APIWindowQuery, now int64) ([]APIWindowSummary, []int) {
-	results := make([]APIWindowSummary, len(queries))
+	windows := make([]apiWindowAccumulator, len(queries))
 	var missing []int
 	byAPI := make(map[usageDimensionID][]int)
 	limit := FloorUnix(now, StatisticsMinute) + StatisticsMinute
@@ -573,15 +576,18 @@ func (state *Accumulator) apiWindows(queries []APIWindowQuery, now int64) ([]API
 				if minute < query.Start || minute >= query.End {
 					continue
 				}
-				metric := &results[i]
-				metric.Requests += dimension.Metric.TotalRequests
-				metric.Tokens += dimension.Metric.TotalTokens
-				metric.Cost += dimension.Metric.TotalCost
-				if _, priced := state.Pricing.Prices[state.Dimensions.value(dimension.Secondary)]; !priced {
-					metric.Unpriced += dimension.Metric.TotalRequests
+				model := state.Dimensions.value(dimension.Secondary)
+				var unpriced int64
+				if _, priced := state.Pricing.Prices[model]; !priced {
+					unpriced = dimension.Metric.TotalRequests
 				}
+				windows[i].add(model, dimension.ServiceTier, dimension.Metric.TotalRequests, dimension.Metric.TotalTokens, dimension.Metric.TotalCost, unpriced)
 			}
 		}
+	}
+	results := make([]APIWindowSummary, len(windows))
+	for i := range windows {
+		results[i] = windows[i].summary()
 	}
 	return results, missing
 }

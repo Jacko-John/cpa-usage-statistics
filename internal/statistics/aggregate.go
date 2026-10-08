@@ -82,6 +82,7 @@ type usageRecordContribution struct {
 	UsageAggregate
 	APIKey          string
 	Model           string
+	ServiceTier     string
 	CredentialKey   string
 	APIID           usageDimensionID
 	ModelID         usageDimensionID
@@ -167,6 +168,7 @@ func (state *Accumulator) newRecordContribution(record Entry, cost float64) usag
 		UsageAggregate: aggregate,
 		APIKey:         apiKey,
 		Model:          model,
+		ServiceTier:    normalizeServiceTier(record.ServiceTier),
 		CredentialKey:  credentialKey,
 		APIID:          apiID,
 		ModelID:        modelID,

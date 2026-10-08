@@ -3,12 +3,14 @@ package notifications
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
 
 	"github.com/Jacko-John/cpa-usage-statistics/internal/statistics"
 	"github.com/Jacko-John/cpa-usage-statistics/internal/storage"
 )
 
-const notificationPeriodColumns = `id,start,end,timezone,email,key_label,note,partial,status,requests,tokens,cost,unpriced,attempts,retry_at,error,skipped`
+const notificationPeriodColumns = `id,start,end,timezone,email,key_label,note,partial,status,requests,tokens,cost,unpriced,attempts,retry_at,error,skipped,details`
 
 func scanNotificationPeriods(ctx context.Context, q storage.SQLQueryer, where string, args ...any) ([]Period, error) {
 	rows, err := q.QueryContext(ctx, `SELECT `+notificationPeriodColumns+` FROM notification_periods `+where, args...)
@@ -19,8 +21,14 @@ func scanNotificationPeriods(ctx context.Context, q storage.SQLQueryer, where st
 	result := []Period{}
 	for rows.Next() {
 		var p Period
-		if err := rows.Scan(&p.ID, &p.Start, &p.End, &p.Timezone, &p.Email, &p.KeyLabel, &p.Note, &p.Partial, &p.Status, &p.Requests, &p.Tokens, &p.Cost, &p.Unpriced, &p.Attempts, &p.RetryAt, &p.Error, &p.Skipped); err != nil {
+		var details []byte
+		if err := rows.Scan(&p.ID, &p.Start, &p.End, &p.Timezone, &p.Email, &p.KeyLabel, &p.Note, &p.Partial, &p.Status, &p.Requests, &p.Tokens, &p.Cost, &p.Unpriced, &p.Attempts, &p.RetryAt, &p.Error, &p.Skipped, &details); err != nil {
 			return nil, err
+		}
+		if len(details) > 0 {
+			if err := json.Unmarshal(details, &p.Details); err != nil {
+				return nil, fmt.Errorf("usage sqlite decode notification details %s: %w", p.ID, err)
+			}
 		}
 		result = append(result, p)
 	}
@@ -70,6 +78,7 @@ func (s *Service) HistoryGet(ctx context.Context, id string, now int64) (History
 			p.Requests = amount.Requests
 			p.Tokens = amount.Tokens
 			p.Unpriced = amount.Unpriced
+			p.Details = amount.Details
 		}
 		result.Periods, err = scanNotificationPeriods(ctx, conn, `WHERE subscription=? AND status!='open' ORDER BY end DESC,id DESC LIMIT 10`, id)
 		return err

@@ -6,7 +6,7 @@ const abiVersion uint32 = 1
 
 // 可通过 -ldflags "-X main.pluginVersion=..." 覆盖。
 var (
-	pluginVersion    = "0.3.1"
+	pluginVersion    = "0.4.0"
 	pluginAuthor     = "Fwindy"
 	pluginRepository = "https://github.com/Jacko-John/cpa-usage-statistics"
 )
