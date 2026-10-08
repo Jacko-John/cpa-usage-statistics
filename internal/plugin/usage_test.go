@@ -39,6 +39,7 @@ func TestToRecordMapping(t *testing.T) {
 }
 
 func TestUsageHandleKeepsDistinctIDsAcrossRestart(t *testing.T) {
+	dataDir := t.TempDir()
 	previousSafety := safety
 	previousSchema := negotiatedSchemaVersion.Load()
 	previousRetention := retentionDays.Load()
@@ -50,7 +51,6 @@ func TestUsageHandleKeepsDistinctIDsAcrossRestart(t *testing.T) {
 		retentionDays.Store(previousRetention)
 	})
 
-	dataDir := t.TempDir()
 	configureForSchemaTest(t, 1, dataDir)
 	payload := []byte(`{
 		"ID":"00000001",
