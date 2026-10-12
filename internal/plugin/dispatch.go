@@ -9,7 +9,7 @@ import (
 const (
 	pluginSchemaVersion uint32 = 2
 	pluginID                   = protocol.PluginID
-	pluginName                 = "Usage Statistics"
+	pluginName                 = "Jacko Usage Statistics"
 
 	// 管理路由由宿主统一挂载到 /v0/management。
 	managementUsagePath                     = "/plugins/" + pluginID + "/usage"

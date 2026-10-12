@@ -8,17 +8,17 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
-
-	"github.com/Jacko-John/cpa-usage-statistics/internal/protocol"
 )
 
 const (
 	defaultSafetyThreshold = int64(3)
 	defaultSafetyWindow    = int64(600)
 	defaultSafetyCooldown  = int64(1800)
+	// 数据位置独立于插件安装 ID，独立发布后继续使用已有数据库。
+	defaultDataDirectory = "usage-statistics"
 )
 
-// pluginConfig 保存 plugins.configs.usage-statistics 下的插件配置。
+// Config 保存宿主传入的当前插件配置，不依赖安装身份解析数据目录。
 type Config struct {
 	DataDir       string
 	RetentionDays int
@@ -112,16 +112,24 @@ func DBPath(cfg Config) (string, error) {
 		dir = strings.TrimSpace(os.Getenv("USAGE_STATISTICS_DIR"))
 	}
 	if dir == "" {
-		if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
-			dir = filepath.Join(home, ".cli-proxy-api", "plugins", protocol.PluginID)
-		} else {
-			dir = filepath.Join(".cli-proxy-api", "plugins", protocol.PluginID)
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = ""
 		}
+		dir = defaultDBDirectory(home)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("usage-statistics: create data dir: %w", err)
 	}
 	return filepath.Join(dir, "usage.db"), nil
+}
+
+// defaultDBDirectory 保留历史数据位置；无用户目录时使用相同名称的相对目录。
+func defaultDBDirectory(home string) string {
+	if strings.TrimSpace(home) == "" {
+		return filepath.Join(".cli-proxy-api", "plugins", defaultDataDirectory)
+	}
+	return filepath.Join(home, ".cli-proxy-api", "plugins", defaultDataDirectory)
 }
 
 func lookupConfig(values map[string]any, key, alias string) (any, bool) {

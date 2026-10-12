@@ -54,7 +54,7 @@ var registrationConfigFields = [...]configFieldInfo{
 
 var registeredManagementRoutes = [...]managementRoute{
 	{Method: "GET", Path: managementNotificationSettingsPath, Description: "读取用量通知设置。"},
-	{Method: "PUT", Path: managementNotificationSettingsPath, Description: "配置通知时间与 QQ SMTP。"},
+	{Method: "PUT", Path: managementNotificationSettingsPath, Description: "配置通知时间、多个 SMTP 发件配置与当前发件邮箱。"},
 	{Method: "GET", Path: managementNotificationSubscriptionsPath, Description: "列出 Key 邮箱订阅。"},
 	{Method: "POST", Path: managementNotificationSubscriptionsPath, Description: "新增通知订阅。"},
 	{Method: "PATCH", Path: managementNotificationSubscriptionsPath, Description: "修改通知订阅。"},

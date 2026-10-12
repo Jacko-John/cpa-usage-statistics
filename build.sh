@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Builds the usage-statistics plugin as a c-shared dynamic library.
+# Builds this plugin as a c-shared dynamic library.
 # c-shared requires CGO_ENABLED=1 and a C toolchain (gcc / mingw-w64).
 # The SQLite driver itself is pure Go (modernc.org/sqlite).
+
+cd "$(dirname "$0")"
+plugin_id="$(sed -n 's/^const PluginID = "\([^"]*\)".*/\1/p' internal/protocol/constants.go)"
+if [[ -z "${plugin_id}" ]]; then
+  echo "Cannot determine plugin ID" >&2
+  exit 1
+fi
+out_dir="${1:-.}"
+mkdir -p "${out_dir}"
 
 ext="so"
 case "$(go env GOOS)" in
@@ -22,8 +31,9 @@ if [[ -n "${PLUGIN_REPOSITORY:-}" ]]; then
   ldflags="${ldflags} -X 'main.pluginRepository=${PLUGIN_REPOSITORY}'"
 fi
 
-CGO_ENABLED="${CGO_ENABLED:-1}" go build -trimpath -ldflags="${ldflags}" -buildmode=c-shared -o "usage-statistics.${ext}" .
+artifact="${out_dir}/${plugin_id}.${ext}"
+CGO_ENABLED="${CGO_ENABLED:-1}" go build -trimpath -ldflags="${ldflags}" -buildmode=c-shared -o "${artifact}" .
 if command -v strip >/dev/null 2>&1; then
-  strip "usage-statistics.${ext}" 2>/dev/null || true
+  strip "${artifact}" 2>/dev/null || true
 fi
-echo "Built $(pwd)/usage-statistics.${ext}"
+echo "Built ${artifact}"

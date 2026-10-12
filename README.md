@@ -1,12 +1,19 @@
-# CPA Usage Statistics
+# Jacko Usage Statistics
 
 CLIProxyAPI 的持久化用量统计插件。插件将请求用量写入本地 SQLite，并提供受管理鉴权保护的查询、删除、安全统计、手动限流解除和 API Key 禁用接口。
 
-当前版本：`0.4.1`
+当前版本：`0.5.0`；独立插件 ID：`jacko-usage-statistics`。
 
 ## 建议使用配套的前端面板
 
-[配套面板](https://github.com/Jacko-John/Cli-Proxy-API-Management-Center)
+[配套面板](https://github.com/Jacko-John/Cli-Proxy-API-Management-Center)使用我们的仓库发布，支持新插件 ID 的版本从 `v1.26.1-patch.2` 开始。宿主自动下载面板时使用以下配置：
+
+```yaml
+remote-management:
+  panel-github-repository: https://github.com/Jacko-John/Cli-Proxy-API-Management-Center
+```
+
+插件目录的 `homepage` 指向该面板仓库；`repository` 和插件注册元数据继续指向本插件后端仓库，供宿主获取插件更新。
 
 ## 功能
 
@@ -21,18 +28,43 @@ CLIProxyAPI 的持久化用量统计插件。插件将请求用量写入本地 S
 - 查看安全触发历史和历史限流记录。
 - 手动解除 API Key 的当前限制并清空其滑动窗口。
 - 永久禁用已经记录安全状态的 API Key，并在重新启用时同时解除自动限流。
+- 保存多个 SMTP 配置，在 QQ 邮箱及其他邮箱服务商之间切换；每次使用一个发件邮箱。
 
 ## 安装
 
-下载对应平台的 release zip，将动态库放到 CLIProxyAPI 的插件目录：
+在面板的插件商店添加以下自有源，安装 `Jacko Usage Statistics`；后续版本可从相同来源更新：
 
 ```text
-plugins/linux/amd64/usage-statistics.so
-plugins/windows/amd64/usage-statistics.dll
-plugins/darwin/arm64/usage-statistics.dylib
+https://raw.githubusercontent.com/Jacko-John/cpa-usage-statistics/main/registry.json
+```
+
+也可在宿主配置中加入源：
+
+```yaml
+plugins:
+  store-sources:
+    - https://raw.githubusercontent.com/Jacko-John/cpa-usage-statistics/main/registry.json
+```
+
+手动安装时，下载对应平台的 [Release zip](https://github.com/Jacko-John/cpa-usage-statistics/releases)，将动态库放到 CLIProxyAPI 的插件目录：
+
+```text
+plugins/linux/amd64/jacko-usage-statistics.so
+plugins/windows/amd64/jacko-usage-statistics.dll
+plugins/darwin/arm64/jacko-usage-statistics.dylib
 ```
 
 放好后重启 CLIProxyAPI。
+
+Release 包名为 `jacko-usage-statistics_<版本>_<系统>_<架构>.zip`，包根目录包含同名插件动态库及许可证，并提供 `checksums.txt`，符合宿主插件商店安装和更新契约。
+
+## 从旧插件身份迁移
+
+本版本更换安装身份和管理路由，SQLite 表结构、数据库文件名及缺省数据目录保持原样：`~/.cli-proxy-api/plugins/usage-statistics/usage.db`。已有用量、价格、安全状态、邮箱配置、订阅和通知历史继续使用同一数据库，不复制或重建数据。
+
+旧版本设置了 `data_dir` 时，需在新插件配置下继续填写同一个目录；`USAGE_STATISTICS_DIR` 仍然有效。将保留期和限流参数也复制到新配置下。独立插件安装不会自动读取或改写旧 ID 的配置。
+
+切换时停用旧 `usage-statistics` 插件，仅启用新插件；两个版本同时使用同一个数据库会重复收集用量、运行通知任务，且各自的内存统计不会协调。不要将旧插件的 `store` 安装清单复制给新 ID；由自有商店源重新安装生成正确清单。配套新面板使用新 ID 的接口，因此插件和面板应配套切换。
 
 自动限流和手动禁用需要宿主支持插件 JSON 消息协议 `schema_version >= 2`。当前检出的 CLIProxyAPI 支持版本 4。
 
@@ -42,7 +74,7 @@ plugins/darwin/arm64/usage-statistics.dylib
 plugins:
   enabled: true
   configs:
-    usage-statistics:
+    jacko-usage-statistics:
       enabled: true
       priority: 100
 
@@ -60,7 +92,7 @@ plugins:
       cooldown: 1800
 ```
 
-`data_dir` 也可用环境变量 `USAGE_STATISTICS_DIR` 指定。所有配置字段都直接位于 `usage-statistics` 下，不使用嵌套的 `safety` 对象。配置支持以下中文别名：`数据目录`、`用量保留天数`、`启用限流`、`触发阈值`、`滑动窗口秒数`、`限流时长秒数`。
+`data_dir` 也可用环境变量 `USAGE_STATISTICS_DIR` 指定。所有配置字段都直接位于 `jacko-usage-statistics` 下，不使用嵌套的 `safety` 对象。配置支持以下中文别名：`数据目录`、`用量保留天数`、`启用限流`、`触发阈值`、`滑动窗口秒数`、`限流时长秒数`。
 
 安全配置规则：
 
@@ -97,7 +129,7 @@ X-Goog-Api-Key: <APIKey>
 ### 按需查询请求事件
 
 ```http
-GET /v0/management/plugins/usage-statistics/usage?start=<RFC3339>&end=<RFC3339>&limit=<数量>
+GET /v0/management/plugins/jacko-usage-statistics/usage?start=<RFC3339>&end=<RFC3339>&limit=<数量>
 ```
 
 - `start` 和 `end` 可选，采用左闭右开时间范围。
@@ -143,11 +175,11 @@ GET /v0/management/plugins/usage-statistics/usage?start=<RFC3339>&end=<RFC3339>&
 ### 读取和更新价格配置
 
 ```http
-GET /v0/management/plugins/usage-statistics/pricing
+GET /v0/management/plugins/jacko-usage-statistics/pricing
 ```
 
 ```http
-PUT /v0/management/plugins/usage-statistics/pricing
+PUT /v0/management/plugins/jacko-usage-statistics/pricing
 Content-Type: application/json
 ```
 
@@ -175,7 +207,7 @@ Context tier 仅在请求的上下文 Token 严格大于 `threshold` 时生效�
 ### 查询预计算统计摘要
 
 ```http
-POST /v0/management/plugins/usage-statistics/usage
+POST /v0/management/plugins/jacko-usage-statistics/usage
 Content-Type: application/json
 ```
 
@@ -211,7 +243,7 @@ Content-Type: application/json
 ### 查询凭证配额窗口统计
 
 ```http
-POST /v0/management/plugins/usage-statistics/usage/credential-windows
+POST /v0/management/plugins/jacko-usage-statistics/usage/credential-windows
 Content-Type: application/json
 ```
 
@@ -254,7 +286,7 @@ Content-Type: application/json
 ### 删除用量记录
 
 ```http
-DELETE /v0/management/plugins/usage-statistics/usage
+DELETE /v0/management/plugins/jacko-usage-statistics/usage
 Content-Type: application/json
 
 {"ids": ["<record-id>", "..."]}
@@ -271,7 +303,7 @@ Content-Type: application/json
 ### 查看每个 API Key 的安全状态
 
 ```http
-GET /v0/management/plugins/usage-statistics/safety/keys
+GET /v0/management/plugins/jacko-usage-statistics/safety/keys
 ```
 
 此接口只读取内存，不查询 SQLite。
@@ -297,7 +329,7 @@ GET /v0/management/plugins/usage-statistics/safety/keys
 ### 查看安全触发历史
 
 ```http
-POST /v0/management/plugins/usage-statistics/safety/history
+POST /v0/management/plugins/jacko-usage-statistics/safety/history
 Content-Type: application/json
 ```
 
@@ -354,7 +386,7 @@ Content-Type: application/json
 ### 手动解除限制
 
 ```http
-DELETE /v0/management/plugins/usage-statistics/safety/limits
+DELETE /v0/management/plugins/jacko-usage-statistics/safety/limits
 Content-Type: application/json
 
 {"api_keys": ["cpa-client-key-1"]}
@@ -383,7 +415,7 @@ Content-Type: application/json
 禁用：
 
 ```http
-POST /v0/management/plugins/usage-statistics/safety/disabled
+POST /v0/management/plugins/jacko-usage-statistics/safety/disabled
 Content-Type: application/json
 
 {"api_keys": ["cpa-client-key-1"]}
@@ -400,7 +432,7 @@ Content-Type: application/json
 重新启用：
 
 ```http
-DELETE /v0/management/plugins/usage-statistics/safety/disabled
+DELETE /v0/management/plugins/jacko-usage-statistics/safety/disabled
 Content-Type: application/json
 
 {"api_keys": ["cpa-client-key-1"]}
@@ -456,7 +488,7 @@ Content-Type: application/json
 
 ### 管理接口
 
-均使用现有宿主管理认证，路径前缀为 `/v0/management/plugins/usage-statistics/notifications`：
+均使用现有宿主管理认证，路径前缀为 `/v0/management/plugins/jacko-usage-statistics/notifications`：
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
@@ -595,10 +627,12 @@ SQLite 表不使用 `CHECK` 约束。请求数据写入前由 Go 对延迟、Tok
 go test ./...
 go test -race ./...
 go vet ./...
-CGO_ENABLED=1 go build -buildmode=c-shared -o /tmp/usage-statistics.so .
+CGO_ENABLED=1 go build -buildmode=c-shared -o /tmp/jacko-usage-statistics.so .
 ```
 
 SMTP 测试启动本地 TLS 服务，不发送真实邮件。发布继续使用 `build.sh` 和 `package-release.sh`，版本变量仍为 `main.pluginVersion`、`main.pluginAuthor` 和 `main.pluginRepository`。后续修改规则见 [AGENTS.md](AGENTS.md)。
+
+本项目基于 [Fwindy/cpa-usage-statistics](https://github.com/Fwindy/cpa-usage-statistics) 扩展，保留 [MIT 许可证](LICENSE) 及原作者版权声明。
 
 ## 已知限制
 

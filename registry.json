@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "jacko-usage-statistics",
+      "name": "Jacko Usage Statistics",
+      "description": "持久化用量统计、费用计算、安全限流与多邮箱通知。",
+      "author": "Jacko-John",
+      "version": "0.5.0",
+      "repository": "https://github.com/Jacko-John/cpa-usage-statistics",
+      "homepage": "https://github.com/Jacko-John/Cli-Proxy-API-Management-Center",
+      "license": "MIT",
+      "tags": ["Management", "Usage", "Statistics", "Notification"]
+    }
+  ]
+}
