@@ -14,6 +14,71 @@ import (
 	"github.com/Jacko-John/cpa-usage-statistics/internal/testutil"
 )
 
+// TestNotificationSMTPProfileManagement 验证列表密码只写不读，以及旧面板回传列表时仍能修改启用项。
+func TestNotificationSMTPProfileManagement(t *testing.T) {
+	s, _ := notificationTestStore(t, time.Now().Unix()-120)
+	storeMu.Lock()
+	old := globalNotifications
+	globalNotifications = s.Service
+	storeMu.Unlock()
+	t.Cleanup(func() {
+		storeMu.Lock()
+		globalNotifications = old
+		storeMu.Unlock()
+	})
+	call := func(method string, input any) protocol.ManagementResponse {
+		body, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return callManagementForTest(t, protocol.ManagementRequest{Method: method, Path: managementNotificationSettingsPath, Body: body})
+	}
+	response := call("GET", nil)
+	var cfg notifications.Settings
+	if err := json.Unmarshal(response.Body, &cfg); err != nil || len(cfg.SMTPProfiles) != 1 {
+		t.Fatalf("settings read failed: %s err=%v", response.Body, err)
+	}
+	primaryID := cfg.ActiveSMTPProfileID
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	profiles := payload["smtp_profiles"].([]any)
+	payload["smtp_profiles"] = append(profiles, map[string]any{
+		"id": "backup", "name": "Backup", "smtp_host": "backup.example.com", "smtp_port": 587,
+		"smtp_security": "starttls", "smtp_username": "backup-login", "sender": "backup@example.com", "password": "backup-secret",
+	})
+	payload["active_smtp_profile_id"] = "backup"
+	response = call("PUT", payload)
+	if response.StatusCode != 200 || strings.Contains(string(response.Body), "backup-secret") || strings.Contains(string(response.Body), "fake-authorization") {
+		t.Fatalf("profile save failed or exposed credentials: %s", response.Body)
+	}
+	if err := json.Unmarshal(response.Body, &cfg); err != nil || cfg.ActiveSMTPProfileID != "backup" || cfg.SMTPHost != "backup.example.com" || len(cfg.SMTPProfiles) != 2 {
+		t.Fatalf("active profile not reflected in legacy fields: err=%v", err)
+	}
+	// 旧面板展开 GET 设置并携带顶层密码字段，其他配置与凭据必须保留。
+	if err := json.Unmarshal(response.Body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	payload["sender"], payload["password"], payload["clear_password"] = "edited@example.com", "legacy-replacement", false
+	response = call("PUT", payload)
+	if response.StatusCode != 200 || strings.Contains(string(response.Body), "legacy-replacement") {
+		t.Fatalf("legacy save failed: %s", response.Body)
+	}
+	if err := json.Unmarshal(response.Body, &cfg); err != nil || len(cfg.SMTPProfiles) != 2 || cfg.SMTPProfiles[0].ID != primaryID || cfg.SMTPProfiles[1].Sender != "edited@example.com" || cfg.ActiveSMTPProfileID != "backup" {
+		t.Fatalf("legacy save replaced another profile: err=%v", err)
+	}
+	s.send = func(_ context.Context, actual notifications.Settings, _ notifications.Mail) (bool, error) {
+		if actual.Password != "legacy-replacement" || actual.Sender != "edited@example.com" {
+			t.Fatal("legacy edit did not update active credentials")
+		}
+		return false, nil
+	}
+	if result, err := s.TestEmail(t.Context(), "recipient@example.com"); err != nil || result.Err != nil {
+		t.Fatalf("test email failed: %v %v", err, result.Err)
+	}
+}
+
 func TestNotificationManagementAndRebind(t *testing.T) {
 	s, _ := notificationTestStore(t, time.Now().Unix()-120)
 	storeMu.Lock()

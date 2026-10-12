@@ -42,13 +42,9 @@ func notificationSettingsGet() ([]byte, error) {
 }
 
 func notificationSettingsPut(req protocol.ManagementRequest) ([]byte, error) {
-	var input struct {
-		notifications.Settings
-		Password      string `json:"password"`
-		ClearPassword bool   `json:"clear_password"`
-	}
+	var input notifications.SettingsUpdate
 	return notificationManagement(req, &input, func(ctx context.Context, store *notifications.Service) (protocol.ManagementResponse, error) {
-		if err := store.SettingsPut(ctx, input.Settings, input.Password, input.ClearPassword, time.Now().Unix()); err != nil {
+		if err := store.SettingsSave(ctx, input, time.Now().Unix()); err != nil {
 			return protocol.ManagementResponse{}, err
 		}
 		settings, err := store.SettingsGet(ctx)

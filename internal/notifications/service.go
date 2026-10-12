@@ -119,7 +119,9 @@ func (s *Service) loadNotificationState(ctx context.Context, conn *sql.Conn) err
 		}
 	}
 	settings.Configured = len(data) > 0
-	settings.Password = password
+	if err := restoreSMTPSettings(&settings, password); err != nil {
+		return err
+	}
 	segments := make(map[int64]notificationSegment)
 	rows, err := conn.QueryContext(ctx, `SELECT id,subscription,api_key,email,note,start,until_at,cursor,schedule FROM notification_segments WHERE until_at=0 OR cursor<until_at ORDER BY id DESC`)
 	if err != nil {

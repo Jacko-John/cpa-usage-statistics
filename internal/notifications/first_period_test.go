@@ -109,8 +109,18 @@ func TestNotificationFirstSegmentBoundaries(t *testing.T) {
 						t.Fatal(err)
 					}
 					var start, cursor int64
-					if err := s.DB.QueryRow("SELECT start,cursor FROM notification_segments WHERE subscription=?", sub.ID).Scan(&start, &cursor); err != nil {
+					var encoded []byte
+					if err := s.DB.QueryRow("SELECT start,cursor,schedule FROM notification_segments WHERE subscription=?", sub.ID).Scan(&start, &cursor, &encoded); err != nil {
 						t.Fatal(err)
+					}
+					// 快照不保存 SMTP 或接口状态；零值字段仍完整保留，重读后边界相同。
+					var fields map[string]json.RawMessage
+					if err := json.Unmarshal(encoded, &fields); err != nil || len(fields) != 6 {
+						t.Fatalf("周期快照应只保存计划字段: %s err=%v", encoded, err)
+					}
+					var restored Settings
+					if err := json.Unmarshal(encoded, &restored); err != nil || restored.storedSchedule() != cfg.storedSchedule() || restored.Boundary(now, false) != cfg.Boundary(now, false) || restored.Boundary(now, true) != cfg.Boundary(now, true) {
+						t.Fatal("计划快照重读后改变启用状态或周期边界", err)
 					}
 					if start != cfg.Boundary(now, false) || cursor != start {
 						t.Fatalf("边界样例 %d 起点错误", i)

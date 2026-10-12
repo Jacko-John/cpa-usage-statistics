@@ -234,7 +234,8 @@ func insertNotificationSegment(ctx context.Context, exec storage.SQLExecer, sub 
 	if !cfg.Enabled || !sub.Enabled || sub.Deleted {
 		return nil
 	}
-	encoded, err := json.Marshal(cfg)
+	// 周期快照只需要计划；邮箱列表由发送时的当前配置决定。
+	encoded, err := json.Marshal(cfg.storedSchedule())
 	if err != nil {
 		return err
 	}

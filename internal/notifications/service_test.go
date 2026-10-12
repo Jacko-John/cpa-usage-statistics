@@ -74,7 +74,7 @@ func TestNotificationSettingsConfigured(t *testing.T) {
 		t.Fatalf("saved settings without SMTP: %+v err=%v", cfg, err)
 	}
 	// 旧设置没有 configured 字段，也应被识别为已保存，不能覆盖原时区。
-	if _, err := s.DB.Exec(`UPDATE notification_settings SET config=? WHERE id=1`, []byte(`{"frequency":"weekly","weekday":5,"hour":20,"timezone":"UTC"}`)); err != nil {
+	if _, err := s.DB.Exec(`UPDATE notification_settings SET config=?,password='' WHERE id=1`, []byte(`{"frequency":"weekly","weekday":5,"hour":20,"timezone":"UTC"}`)); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -86,7 +86,7 @@ func TestNotificationSettingsConfigured(t *testing.T) {
 	}
 	defer reopened.Close()
 	cfg, err = reopened.SettingsGet(ctx)
-	if err != nil || !cfg.Configured || cfg.Timezone != "UTC" {
+	if err != nil || !cfg.Configured || cfg.Timezone != "UTC" || cfg.PasswordConfigured {
 		t.Fatalf("legacy settings after restart: %+v err=%v", cfg, err)
 	}
 }
