@@ -82,8 +82,16 @@ jobs:
         run: go test ./...
 
       - name: Package
-        # Windows zip is installed in MSYS2, so use that environment consistently.
-        shell: ${{ matrix.goos == 'windows' && 'msys2 {0}' || 'bash' }}
+        if: matrix.goos != 'windows'
+        shell: bash
+        run: bash ./package-release.sh dist
+
+      - name: Package Windows
+        if: matrix.goos == 'windows'
+        # Use the installed zip and compiler, and inherit the setup-go PATH.
+        shell: msys2 {0}
+        env:
+          MSYS2_PATH_TYPE: inherit
         run: bash ./package-release.sh dist
 
       - name: Upload artifact
