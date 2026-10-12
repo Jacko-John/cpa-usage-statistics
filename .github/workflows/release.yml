@@ -5,6 +5,12 @@ on:
     tags:
       - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing version tag to rebuild and publish; leave empty to build only"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -39,6 +45,8 @@ jobs:
       PLUGIN_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - uses: actions/setup-go@v5
         with:
@@ -59,15 +67,23 @@ jobs:
         run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Resolve version from tag
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
         shell: bash
-        run: echo "PLUGIN_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected an existing vMAJOR.MINOR.PATCH tag" >&2
+            exit 1
+          fi
+          echo "PLUGIN_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
 
       - name: Test
         run: go test ./...
 
       - name: Package
-        shell: bash
+        # Windows zip is installed in MSYS2, so use that environment consistently.
+        shell: ${{ matrix.goos == 'windows' && 'msys2 {0}' || 'bash' }}
         run: bash ./package-release.sh dist
 
       - name: Upload artifact
@@ -82,7 +98,7 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -96,6 +112,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           files: |
             *.zip
             checksums.txt
